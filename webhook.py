@@ -5,7 +5,6 @@ from fastapi import APIRouter, Request, HTTPException
 import logging
 from datetime import datetime
 from database import get_cursor
-from models import Signal
 from utils import normalize_symbol
 
 logger = logging.getLogger(__name__)
