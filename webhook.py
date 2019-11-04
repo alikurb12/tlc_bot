@@ -50,10 +50,10 @@ async def handle_move_sl_signal(data: dict):
         try:
             if exchange == 'bingx':
                 from services import process_bingx_move_sl
-                result = process_bingx_move_sl(user, normalized_symbol)
+                result = await process_bingx_move_sl(user, normalized_symbol)
             elif exchange == 'okx':
                 from services import process_okx_move_sl
-                result = process_okx_move_sl(user, normalized_symbol)
+                result = await process_okx_move_sl(user, normalized_symbol)
             else:
                 logger.error(f"Неизвестная биржа: {exchange} для пользователя {user_id}")
                 continue
