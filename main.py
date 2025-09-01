@@ -253,7 +253,7 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
     referral_uuid = message.text.strip()
     logging.info(f"Processing UUID {referral_uuid} for user {user_id}")
 
-    if len(referral_uuid) < 10:
+    if len(referral_uuid) < 8:
         await message.answer("❌ Неверный формат UUID. Пожалуйста, попробуйте снова:")
         return
 
@@ -489,18 +489,119 @@ async def handle_invalid_input(message: types.Message, state: FSMContext):
         )
         await state.clear()
 
+import aiohttp  # Добавляем для обработки тайм-аутов
+
+# Словарь с путями к видеоинструкциям для каждой биржи
+VIDEO_INSTRUCTIONS = {
+    'bingx': 'videos/bingx_instruction.mp4',  # Путь к видео для BingX
+    'okx': 'videos/okx_instruction.mp4'      # Путь к видео для OKX
+}
+
 @router.callback_query(F.data.startswith("exchange:"))
 async def process_exchange(callback_query: types.CallbackQuery, state: FSMContext):
     exchange = callback_query.data.split(":")[1]
-    await callback_query.message.edit_text('''
-Для того, чтобы успешно провести автоматизацию, вам нужно будет прислать api ключ и secret key с вашей биржи. 
-ВАЖНО!
-Мы не используем ваши данные в личных целях и не передаем их третьим лицам! Все данные хранятся в защищенной базе данных, мы используем их только для того, чтобы иметь возможность прямого запроса команд на биржу.
-Пожалуйста, напишите ваш API ключ:
-''')
-    await state.update_data(exchange=exchange)
-    await state.set_state(PaymentStates.waiting_for_api_key)
-    logging.info(f"Exchange selected: {exchange} for user {callback_query.from_user.id}")
+    user_id = callback_query.from_user.id
+    video_path = VIDEO_INSTRUCTIONS.get(exchange)
+
+    # Проверка существования файла
+    if not video_path or not os.path.exists(video_path):
+        logging.error(f"Video file for {exchange} not found at {video_path}")
+        try:
+            await callback_query.message.edit_text(
+                "❌ Ошибка: Видеоинструкция для выбранной биржи недоступна. Пожалуйста, свяжитесь с поддержкой."
+            )
+        except TelegramBadRequest:
+            await bot.send_message(
+                chat_id=user_id,
+                text="❌ Ошибка: Видеоинструкция для выбранной биржи недоступна. Пожалуйста, свяжитесь с поддержкой."
+            )
+        return
+
+    try:
+        # Проверка размера файла (до 50 МБ)
+        file_size = os.path.getsize(video_path) / (1024 * 1024)  # Размер в МБ
+        if file_size > 50:
+            logging.error(f"Video file {video_path} too large: {file_size} MB")
+            await callback_query.message.edit_text(
+                "❌ Ошибка: Видео слишком большое для отправки. Пожалуйста, свяжитесь с поддержкой для получения инструкции."
+            )
+            return
+
+        # Попытка отправки видео с тайм-аутом
+        for attempt in range(3):  # Пробуем до 3 раз
+            try:
+                await bot.send_video(
+                    chat_id=user_id,
+                    video=types.FSInputFile(video_path),
+                    caption=f"📹 Ознакомьтесь с видеоинструкцией по созданию API-ключа для {exchange.upper()}:",
+                    request_timeout=100  # Увеличиваем тайм-аут до 30 секунд
+                )
+                break  # Успешно отправили, выходим из цикла
+            except aiohttp.ClientError as e:
+                logging.warning(f"Attempt {attempt + 1} failed for user {user_id}: {e}")
+                if attempt == 2:
+                    logging.error(f"All attempts to send video for {exchange} to user {user_id} failed")
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text="❌ Ошибка при отправке видеоинструкции из-за сетевых проблем. Пожалуйста, попробуйте снова позже."
+                    )
+                    return
+                await asyncio.sleep(2)  # Пауза перед следующей попыткой
+
+        # Отправляем сообщение с запросом API-ключа
+        await bot.send_message(
+            chat_id=user_id,
+            text='''
+Для успешной автоматизации вам нужно будет предоставить API-ключ и Secret Key с вашей биржи. 
+ВАЖНО! Мы не используем ваши данные в личных целях и не передаем их третьим лицам! 
+Все данные хранятся в защищенной базе данных и используются только для отправки команд на биржу.
+Пожалуйста, введите ваш API-ключ:
+'''
+        )
+        await state.update_data(exchange=exchange)
+        await state.set_state(PaymentStates.waiting_for_api_key)
+        logging.info(f"Exchange selected: {exchange} for user {user_id}, video sent: {video_path}")
+
+    except TelegramForbiddenError:
+        logging.error(f"User {user_id} blocked the bot")
+        try:
+            await bot.send_message(
+                chat_id=MODERATOR_GROUP_ID,
+                text=f"Пользователь {user_id} заблокировал бота при попытке отправки видео для {exchange}."
+            )
+        except Exception as mod_error:
+            logging.error(f"Failed to notify moderator group about user {user_id} blocking bot: {mod_error}")
+        try:
+            await callback_query.message.edit_text(
+                "❌ Вы заблокировали бота. Разблокируйте, чтобы продолжить."
+            )
+        except TelegramBadRequest:
+            # Если сообщение не удается отредактировать, не отправляем новое, так как пользователь заблокировал бота
+            pass
+    except TelegramBadRequest as e:
+        logging.error(f"Telegram error sending video for {exchange} to user {user_id}: {e}")
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text="❌ Ошибка при отправке видеоинструкции. Пожалуйста, попробуйте снова или свяжитесь с поддержкой."
+            )
+        except TelegramBadRequest:
+            await bot.send_message(
+                chat_id=MODERATOR_GROUP_ID,
+                text=f"Не удалось отправить сообщение пользователю {user_id} из-за ошибки: {e}"
+            )
+    except Exception as e:
+        logging.error(f"Unexpected error sending video for {exchange} to user {user_id}: {e}")
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text="❌ Произошла ошибка. Пожалуйста, попробуйте снова или свяжитесь с поддержкой."
+            )
+        except TelegramBadRequest:
+            await bot.send_message(
+                chat_id=MODERATOR_GROUP_ID,
+                text=f"Не удалось отправить сообщение пользователю {user_id} из-за ошибки: {e}"
+            )
 
 @router.message(PaymentStates.waiting_for_api_key)
 async def process_api_key(message: types.Message, state: FSMContext):
