@@ -13,6 +13,7 @@ from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.enums.chat_member_status import ChatMemberStatus
 import requests
+import aiohttp
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -94,6 +95,7 @@ TARIFFS = {
 
 class PaymentStates(StatesGroup):
     waiting_for_subscription_type = State()
+    waiting_for_exchange = State()
     waiting_for_referral_uuid = State()
     waiting_for_payment = State()
     waiting_for_api_key = State()
@@ -162,6 +164,11 @@ async def is_bot_in_group():
         logging.error(f"Ошибка при проверке нахождения бота в группе: {e}")
         return False
 
+VIDEO_INSTRUCTIONS = {
+    'bingx': 'videos/bingx_instruction.mp4',
+    'okx': 'videos/okx_instruction.mp4'
+}
+
 @router.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     is_in_group = await is_bot_in_group()
@@ -227,13 +234,11 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
             )
             return
         await callback_query.message.edit_text(
-            "📎 Пожалуйста, введите ваш UUID с биржи для модерации:",
-            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")]
-            ])
+            "Выберите биржу для реферальной подписки:",
+            reply_markup=get_exchange_keyboard()
         )
         await state.update_data(subscription_type=subscription_type, user_id=user_id)
-        await state.set_state(PaymentStates.waiting_for_referral_uuid)
+        await state.set_state(PaymentStates.waiting_for_exchange)
     else:
         cursor.execute(
             "INSERT INTO users (user_id, subscription_type) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s",
@@ -247,32 +252,139 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
         await state.update_data(subscription_type="regular")
         await state.set_state(PaymentStates.waiting_for_payment)
 
+@router.callback_query(F.data.startswith("exchange:"))
+async def process_exchange(callback_query: types.CallbackQuery, state: FSMContext):
+    exchange = callback_query.data.split(":")[1]
+    user_id = callback_query.from_user.id
+    video_path = VIDEO_INSTRUCTIONS.get(exchange)
+
+    if not video_path or not os.path.exists(video_path):
+        logging.error(f"Video file for {exchange} not found at {video_path}")
+        try:
+            await callback_query.message.edit_text(
+                "❌ Ошибка: Видеоинструкция для выбранной биржи недоступна. Пожалуйста, свяжитесь с поддержкой."
+            )
+        except TelegramBadRequest:
+            await bot.send_message(
+                chat_id=user_id,
+                text="❌ Ошибка: Видеоинструкция для выбранной биржи недоступна. Пожалуйста, свяжитесь с поддержкой."
+            )
+        return
+
+    try:
+        file_size = os.path.getsize(video_path) / (1024 * 1024)
+        if file_size > 50:
+            logging.error(f"Video file {video_path} too large: {file_size} MB")
+            await callback_query.message.edit_text(
+                "❌ Ошибка: Видео слишком большое для отправки. Пожалуйста, свяжитесь с поддержкой для получения инструкции."
+            )
+            return
+
+        for attempt in range(3):
+            try:
+                await bot.send_video(
+                    chat_id=user_id,
+                    video=types.FSInputFile(video_path),
+                    caption=f"📹 Ознакомьтесь с видеоинструкцией по созданию API-ключа для {exchange.upper()}:",
+                    request_timeout=100
+                )
+                break
+            except aiohttp.ClientError as e:
+                logging.warning(f"Attempt {attempt + 1} failed for user {user_id}: {e}")
+                if attempt == 2:
+                    logging.error(f"All attempts to send video for {exchange} to user {user_id} failed")
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text="❌ Ошибка при отправке видеоинструкции из-за сетевых проблем. Пожалуйста, попробуйте снова позже."
+                    )
+                    return
+                await asyncio.sleep(2)
+
+        await bot.send_message(
+            chat_id=user_id,
+            text="📎 Пожалуйста, введите ваш UUID с биржи для модерации:",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")]
+            ])
+        )
+        await state.update_data(exchange=exchange)
+        await state.set_state(PaymentStates.waiting_for_referral_uuid)
+        logging.info(f"Exchange selected: {exchange} for user {user_id}, video sent: {video_path}")
+
+    except TelegramForbiddenError:
+        logging.error(f"User {user_id} blocked the bot")
+        try:
+            await bot.send_message(
+                chat_id=MODERATOR_GROUP_ID,
+                text=f"Пользователь {user_id} заблокировал бота при попытке отправки видео для {exchange}."
+            )
+        except Exception as mod_error:
+            logging.error(f"Failed to notify moderator group about user {user_id} blocking bot: {mod_error}")
+        try:
+            await callback_query.message.edit_text(
+                "❌ Вы заблокировали бота. Разблокируйте, чтобы продолжить."
+            )
+        except TelegramBadRequest:
+            pass
+    except TelegramBadRequest as e:
+        logging.error(f"Telegram error sending video for {exchange} to user {user_id}: {e}")
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text="❌ Ошибка при отправке видеоинструкции. Пожалуйста, попробуйте снова или свяжитесь с поддержкой."
+            )
+        except TelegramBadRequest:
+            await bot.send_message(
+                chat_id=MODERATOR_GROUP_ID,
+                text=f"Не удалось отправить сообщение пользователю {user_id} из-за ошибки: {e}"
+            )
+    except Exception as e:
+        logging.error(f"Unexpected error sending video for {exchange} to user {user_id}: {e}")
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text="❌ Произошла ошибка. Пожалуйста, попробуйте снова или свяжитесь с поддержкой."
+            )
+        except TelegramBadRequest:
+            await bot.send_message(
+                chat_id=MODERATOR_GROUP_ID,
+                text=f"Не удалось отправить сообщение пользователю {user_id} из-за ошибки: {e}"
+            )
+
 @router.message(PaymentStates.waiting_for_referral_uuid)
 async def process_referral_uuid(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     referral_uuid = message.text.strip()
-    logging.info(f"Processing UUID {referral_uuid} for user {user_id}")
+    data = await state.get_data()
+    exchange = data.get('exchange')
+    logging.info(f"Processing UUID {referral_uuid} for user {user_id}, exchange: {exchange}")
 
     if len(referral_uuid) < 8:
         await message.answer("❌ Неверный формат UUID. Пожалуйста, попробуйте снова:")
         return
 
-    cursor.execute("SELECT subscription_type FROM users WHERE user_id = %s", (user_id,))
+    cursor.execute("SELECT subscription_type, subscription_end, api_key FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
     if result and result['subscription_type'] == "referral_pending":
         await message.answer("⏳ Ваш предыдущий UUID ещё на модерации. Пожалуйста, дождитесь ответа.")
         return
-    elif result and result['subscription_type'] == "referral_approved":
-        await message.answer(
-            "✅ У вас уже есть подтверждённая реферальная подписка. Выберите биржу для подключения API:",
-            reply_markup=get_exchange_keyboard()
-        )
-        await state.set_state(PaymentStates.waiting_for_api_key)
+    elif result and result['subscription_type'] == "referral_approved" and result['subscription_end'] > datetime.datetime.now():
+        if result['api_key']:
+            await message.answer(
+                "✅ У вас уже есть активная реферальная подписка и подключённый API. Выберите действие:",
+                reply_markup=get_main_menu(user_id)
+            )
+        else:
+            await message.answer(
+                "✅ У вас уже есть активная реферальная подписка. Введите ваш API-ключ:",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+            await state.set_state(PaymentStates.waiting_for_api_key)
         return
 
     cursor.execute(
-        "INSERT INTO users (user_id, subscription_type, referral_uuid) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s, referral_uuid = %s",
-        (user_id, "referral_pending", referral_uuid, "referral_pending", referral_uuid)
+        "INSERT INTO users (user_id, subscription_type, referral_uuid, exchange) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s, referral_uuid = %s, exchange = %s",
+        (user_id, "referral_pending", referral_uuid, exchange, "referral_pending", referral_uuid, exchange)
     )
     conn.commit()
 
@@ -281,6 +393,7 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
             MODERATOR_GROUP_ID,
             f"Новый запрос на реферальную подписку:\n"
             f"Пользователь: {user_id}\n"
+            f"Биржа: {exchange.upper()}\n"
             f"UUID: {referral_uuid}\n"
             f"Пожалуйста, подтвердите или отклоните запрос.",
             reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
@@ -314,27 +427,30 @@ async def process_moderator_decision(callback_query: types.CallbackQuery, state:
             )
             conn.commit()
             try:
+                cursor.execute("SELECT api_key, exchange FROM users WHERE user_id = %s", (user_id,))
+                result = cursor.fetchone()
                 current_state = await state.get_state()
                 logging.info(f"Current state for user {user_id} after UUID approval: {current_state}")
-                if current_state not in [PaymentStates.waiting_for_api_key, PaymentStates.waiting_for_secret_key, PaymentStates.waiting_for_passphrase]:
+                if result['api_key']:
                     await bot.send_message(
                         user_id,
-                        "✅ Ваш UUID подтверждён модератором! Выберите биржу для подключения API:",
-                        reply_markup=get_exchange_keyboard()
+                        "✅ Ваш UUID подтверждён модератором! API-ключ уже подключён. Выберите действие:",
+                        reply_markup=get_main_menu(user_id)
                     )
-                    await state.set_state(PaymentStates.waiting_for_api_key)
+                    await state.clear()
                 else:
-                    if current_state == PaymentStates.waiting_for_api_key:
-                        await bot.send_message(user_id, '''
-Для того, чтобы успешно провести автоматизацию, вам нужно будет прислать api ключ и secret key с вашей биржи. 
-ВАЖНО!
-Мы не используем ваши данные в личных целях и не передаем их третьим лицам! Все данные хранятся в защищенной базе данных, мы используем их только для того, чтобы иметь возможность прямого запроса команд на биржу.
-Пожалуйста, напишите ваш API ключ:
-''')
-                    elif current_state == PaymentStates.waiting_for_secret_key:
-                        await bot.send_message(user_id, "Пожалуйста, введите ваш Secret Key:")
-                    elif current_state == PaymentStates.waiting_for_passphrase:
-                        await bot.send_message(user_id, "Пожалуйста, введите ваш Passphrase:")
+                    await bot.send_message(
+                        user_id,
+                        '''
+Для успешной автоматизации вам нужно будет предоставить API-ключ и Secret Key с вашей биржи. 
+ВАЖНО! Мы не используем ваши данные в личных целях и не передаем их третьим лицам! 
+Все данные хранятся в защищенной базе данных и используются только для отправки команд на биржу.
+Пожалуйста, введите ваш API-ключ:
+''',
+                        reply_markup=types.ReplyKeyboardRemove()
+                    )
+                    await state.update_data(exchange=result['exchange'])
+                    await state.set_state(PaymentStates.waiting_for_api_key)
                 await callback_query.message.edit_text(
                     f"Решение по UUID для пользователя {user_id}: Подтверждено"
                 )
@@ -458,151 +574,6 @@ async def subscription_info(message: types.Message, state: FSMContext):
         )
         await state.set_state(PaymentStates.waiting_for_subscription_type)
 
-@router.message(lambda message: message.text not in ["Подключить API", "Информация о подписке"])
-async def handle_invalid_input(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    current_state = await state.get_state()
-    logging.info(f"Invalid input from user {user_id}, state: {current_state}, input: {message.text}")
-
-    cursor.execute("SELECT subscription_type, subscription_end FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-
-    if current_state == PaymentStates.waiting_for_api_key:
-        await process_api_key(message, state)
-        return
-    elif current_state == PaymentStates.waiting_for_secret_key:
-        await process_secret_key(message, state)
-        return
-    elif current_state == PaymentStates.waiting_for_passphrase:
-        await process_passphrase(message, state)
-        return
-    elif result and result['subscription_type'] == "referral_approved" and result['subscription_end'] > datetime.datetime.now():
-        await message.answer(
-            "✅ У вас есть активная подписка. Выберите действие:",
-            reply_markup=get_main_menu(user_id)
-        )
-        await state.clear()
-    else:
-        await message.answer(
-            "❗️ Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
-            reply_markup=get_main_menu(user_id)
-        )
-        await state.clear()
-
-import aiohttp  # Добавляем для обработки тайм-аутов
-
-# Словарь с путями к видеоинструкциям для каждой биржи
-VIDEO_INSTRUCTIONS = {
-    'bingx': 'videos/bingx_instruction.mp4',  # Путь к видео для BingX
-    'okx': 'videos/okx_instruction.mp4'      # Путь к видео для OKX
-}
-
-@router.callback_query(F.data.startswith("exchange:"))
-async def process_exchange(callback_query: types.CallbackQuery, state: FSMContext):
-    exchange = callback_query.data.split(":")[1]
-    user_id = callback_query.from_user.id
-    video_path = VIDEO_INSTRUCTIONS.get(exchange)
-
-    # Проверка существования файла
-    if not video_path or not os.path.exists(video_path):
-        logging.error(f"Video file for {exchange} not found at {video_path}")
-        try:
-            await callback_query.message.edit_text(
-                "❌ Ошибка: Видеоинструкция для выбранной биржи недоступна. Пожалуйста, свяжитесь с поддержкой."
-            )
-        except TelegramBadRequest:
-            await bot.send_message(
-                chat_id=user_id,
-                text="❌ Ошибка: Видеоинструкция для выбранной биржи недоступна. Пожалуйста, свяжитесь с поддержкой."
-            )
-        return
-
-    try:
-        # Проверка размера файла (до 50 МБ)
-        file_size = os.path.getsize(video_path) / (1024 * 1024)  # Размер в МБ
-        if file_size > 50:
-            logging.error(f"Video file {video_path} too large: {file_size} MB")
-            await callback_query.message.edit_text(
-                "❌ Ошибка: Видео слишком большое для отправки. Пожалуйста, свяжитесь с поддержкой для получения инструкции."
-            )
-            return
-
-        # Попытка отправки видео с тайм-аутом
-        for attempt in range(3):  # Пробуем до 3 раз
-            try:
-                await bot.send_video(
-                    chat_id=user_id,
-                    video=types.FSInputFile(video_path),
-                    caption=f"📹 Ознакомьтесь с видеоинструкцией по созданию API-ключа для {exchange.upper()}:",
-                    request_timeout=100  # Увеличиваем тайм-аут до 30 секунд
-                )
-                break  # Успешно отправили, выходим из цикла
-            except aiohttp.ClientError as e:
-                logging.warning(f"Attempt {attempt + 1} failed for user {user_id}: {e}")
-                if attempt == 2:
-                    logging.error(f"All attempts to send video for {exchange} to user {user_id} failed")
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text="❌ Ошибка при отправке видеоинструкции из-за сетевых проблем. Пожалуйста, попробуйте снова позже."
-                    )
-                    return
-                await asyncio.sleep(2)  # Пауза перед следующей попыткой
-
-        # Отправляем сообщение с запросом API-ключа
-        await bot.send_message(
-            chat_id=user_id,
-            text='''
-Для успешной автоматизации вам нужно будет предоставить API-ключ и Secret Key с вашей биржи. 
-ВАЖНО! Мы не используем ваши данные в личных целях и не передаем их третьим лицам! 
-Все данные хранятся в защищенной базе данных и используются только для отправки команд на биржу.
-Пожалуйста, введите ваш API-ключ:
-'''
-        )
-        await state.update_data(exchange=exchange)
-        await state.set_state(PaymentStates.waiting_for_api_key)
-        logging.info(f"Exchange selected: {exchange} for user {user_id}, video sent: {video_path}")
-
-    except TelegramForbiddenError:
-        logging.error(f"User {user_id} blocked the bot")
-        try:
-            await bot.send_message(
-                chat_id=MODERATOR_GROUP_ID,
-                text=f"Пользователь {user_id} заблокировал бота при попытке отправки видео для {exchange}."
-            )
-        except Exception as mod_error:
-            logging.error(f"Failed to notify moderator group about user {user_id} blocking bot: {mod_error}")
-        try:
-            await callback_query.message.edit_text(
-                "❌ Вы заблокировали бота. Разблокируйте, чтобы продолжить."
-            )
-        except TelegramBadRequest:
-            # Если сообщение не удается отредактировать, не отправляем новое, так как пользователь заблокировал бота
-            pass
-    except TelegramBadRequest as e:
-        logging.error(f"Telegram error sending video for {exchange} to user {user_id}: {e}")
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text="❌ Ошибка при отправке видеоинструкции. Пожалуйста, попробуйте снова или свяжитесь с поддержкой."
-            )
-        except TelegramBadRequest:
-            await bot.send_message(
-                chat_id=MODERATOR_GROUP_ID,
-                text=f"Не удалось отправить сообщение пользователю {user_id} из-за ошибки: {e}"
-            )
-    except Exception as e:
-        logging.error(f"Unexpected error sending video for {exchange} to user {user_id}: {e}")
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text="❌ Произошла ошибка. Пожалуйста, попробуйте снова или свяжитесь с поддержкой."
-            )
-        except TelegramBadRequest:
-            await bot.send_message(
-                chat_id=MODERATOR_GROUP_ID,
-                text=f"Не удалось отправить сообщение пользователю {user_id} из-за ошибки: {e}"
-            )
-
 @router.message(PaymentStates.waiting_for_api_key)
 async def process_api_key(message: types.Message, state: FSMContext):
     api_key = message.text.strip()
@@ -644,7 +615,7 @@ async def process_secret_key(message: types.Message, state: FSMContext):
     if exchange == 'okx':
         await message.answer("Введите ваш Passphrase:")
         await state.set_state(PaymentStates.waiting_for_passphrase)
-    else:  # BingX
+    else:
         cursor.execute(
             "UPDATE users SET api_key = %s, secret_key = %s, passphrase = NULL, exchange = %s WHERE user_id = %s",
             (api_key, secret_key, exchange, user_id)
@@ -694,6 +665,40 @@ async def cancel_action(callback_query: types.CallbackQuery, state: FSMContext):
         reply_markup=get_main_menu(callback_query.from_user.id)
     )
     await state.clear()
+
+@router.message(lambda message: message.text not in ["Подключить API", "Информация о подписке"])
+async def handle_invalid_input(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    current_state = await state.get_state()
+    logging.info(f"Invalid input from user {user_id}, state: {current_state}, input: {message.text}")
+
+    cursor.execute("SELECT subscription_type, subscription_end FROM users WHERE user_id = %s", (user_id,))
+    result = cursor.fetchone()
+
+    if current_state == PaymentStates.waiting_for_api_key:
+        await process_api_key(message, state)
+        return
+    elif current_state == PaymentStates.waiting_for_secret_key:
+        await process_secret_key(message, state)
+        return
+    elif current_state == PaymentStates.waiting_for_passphrase:
+        await process_passphrase(message, state)
+        return
+    elif current_state == PaymentStates.waiting_for_referral_uuid:
+        await process_referral_uuid(message, state)
+        return
+    elif result and result['subscription_type'] == "referral_approved" and result['subscription_end'] > datetime.datetime.now():
+        await message.answer(
+            "✅ У вас есть активная подписка. Выберите действие:",
+            reply_markup=get_main_menu(user_id)
+        )
+        await state.clear()
+    else:
+        await message.answer(
+            "❗️ Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
+            reply_markup=get_main_menu(user_id)
+        )
+        await state.clear()
 
 async def check_subscriptions():
     while True:
