@@ -55,7 +55,7 @@ def set_leverage(symbol: str, leverage: int=10, position_side: str="LONG", api_k
         paramsMap = {
             "symbol": symbol,
             "leverage": leverage,
-            "positionSide": position_side,
+            "side": position_side,
         }
         paramsStr = parseParam(paramsMap)
         responce = send_request(method, path, paramsStr, {}, api_key, secret_key)
