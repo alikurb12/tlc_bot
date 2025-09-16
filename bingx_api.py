@@ -48,7 +48,7 @@ def get_symbol_info(symbol: str) -> dict:
         logger.error(f"Ошибка при получении информации о паре: {symbol}")
         raise
 
-def set_leverage(symbol: str, leverage: int=10, position_side: str="LONG", api_key: str=None, secret_key: str=None) -> bool:
+def set_leverage(symbol: str, leverage: int=5, position_side: str="LONG", api_key: str=None, secret_key: str=None) -> bool:
     try:
         path = '/openApi/swap/v2/trade/leverage'
         method = "POST"
@@ -69,7 +69,7 @@ def set_leverage(symbol: str, leverage: int=10, position_side: str="LONG", api_k
         raise
 
 
-def calculate_quantity(symbol: str, leverage: int = 10, risk_percent: float = 0.10, api_key: str = None,
+def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.10, api_key: str = None,
                        secret_key: str = None) -> float:
     try:
         balance_response = get_balance(api_key, secret_key)

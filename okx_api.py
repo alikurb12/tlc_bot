@@ -66,7 +66,7 @@ def get_balance(api_key: str, secret_key: str, passphrase: str) -> float:
         raise
 
 
-def set_leverage(symbol: str, leverage: int = 10, tdMode: str = "isolated", posSide: str = "long", api_key: str = None,
+def set_leverage(symbol: str, leverage: int = 5, tdMode: str = "isolated", posSide: str = "long", api_key: str = None,
                  secret_key: str = None, passphrase: str = None) -> bool:
     try:
         account_api = AccountAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
@@ -86,7 +86,7 @@ def set_leverage(symbol: str, leverage: int = 10, tdMode: str = "isolated", posS
         raise
 
 
-def calculate_quantity(symbol: str, leverage: int = 10, risk_percent: float = 0.10, api_key: str = None,
+def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.10, api_key: str = None,
                        secret_key: str = None, passphrase: str = None) -> float:
     try:
         usdt_balance = get_balance(api_key, secret_key, passphrase)
