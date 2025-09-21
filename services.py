@@ -1,9 +1,10 @@
-# services.py
 import time
 import json
 import logging
+import asyncio
 from typing import Dict, Optional
 from database import get_cursor, commit
+from main import bot, send_signal_notification
 from bingx_api import (
     get_balance as bingx_get_balance,
     set_leverage as bingx_set_leverage,
@@ -19,7 +20,6 @@ from okx_api import (
 )
 
 logger = logging.getLogger(__name__)
-
 
 def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     user_id = user['user_id']
@@ -96,6 +96,13 @@ def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         )
         commit()
 
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(send_signal_notification(signal, user_id), loop)
+            logger.info(f"Запущена отправка уведомления для пользователя {user_id}")
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления для user {user_id}: {notify_error}")
+
         return {
             "user_id": user_id,
             "exchange": "bingx",
@@ -107,7 +114,6 @@ def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"Ошибка обработки сигнала BingX для пользователя {user_id}: {str(e)}")
         return None
-
 
 def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     user_id = user['user_id']
@@ -165,6 +171,13 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         )
         trade_id = cursor.fetchone()['trade_id']
         commit()
+
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(send_signal_notification(signal, user_id), loop)
+            logger.info(f"Запущена отправка уведомления для пользователя {user_id}")
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления для user {user_id}: {notify_error}")
 
         return {
             "user_id": user_id,

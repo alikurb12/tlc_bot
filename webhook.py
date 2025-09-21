@@ -1,4 +1,3 @@
-
 import json
 from fastapi import APIRouter, Request, HTTPException
 import logging
@@ -71,7 +70,7 @@ async def webhook(request: Request):
             stop_loss=stop_loss,
             take_profit_1=take_profit_1,
             take_profit_2=take_profit_2,
-            take_profit_3=take_profit_3, # Use JSON data directly
+            take_profit_3=take_profit_3,
         )
 
         cursor = get_cursor()
@@ -98,7 +97,7 @@ async def webhook(request: Request):
                 "stop_loss": stop_loss,
                 "take_profit_1": take_profit_1,
                 "take_profit_2": take_profit_2,
-                "take_profit_3": take_profit_3,  # Now safe, as quantity_percent is in Signal
+                "take_profit_3": take_profit_3,
             }
 
             try:

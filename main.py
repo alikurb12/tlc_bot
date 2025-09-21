@@ -52,6 +52,7 @@ except Exception as e:
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
+        chat_id BIGINT,
         subscription_end TIMESTAMP,
         subscription_type TEXT,
         referral_uuid TEXT,
@@ -75,6 +76,17 @@ cursor.execute("""
 cursor.execute("""
     SELECT column_name 
     FROM information_schema.columns 
+    WHERE table_name = 'users' AND column_name = 'chat_id';
+""")
+if not cursor.fetchone():
+    logging.info("Adding chat_id column to users table...")
+    cursor.execute("ALTER TABLE users ADD COLUMN chat_id BIGINT;")
+    conn.commit()
+    logging.info("Column chat_id added to users table.")
+
+cursor.execute("""
+    SELECT column_name 
+    FROM information_schema.columns 
     WHERE table_name = 'users' AND column_name = 'passphrase';
 """)
 if not cursor.fetchone():
@@ -93,6 +105,7 @@ TARIFFS = {
     '12months': {'days': 365, 'price': 640, 'name': '12 месяцев (Выгода 200$)'}
 }
 
+
 class PaymentStates(StatesGroup):
     waiting_for_subscription_type = State()
     waiting_for_exchange = State()
@@ -101,6 +114,7 @@ class PaymentStates(StatesGroup):
     waiting_for_api_key = State()
     waiting_for_secret_key = State()
     waiting_for_passphrase = State()
+
 
 def create_invoice(user_id, amount, description):
     url = "https://pay.crypt.bot/api/createInvoice"
@@ -120,12 +134,14 @@ def create_invoice(user_id, amount, description):
         logging.error(f"Error creating CryptoBot invoice: {request_error}")
         return None
 
+
 def get_subscription_type_keyboard():
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="Обычная подписка", callback_data="subscription:regular")],
         [types.InlineKeyboardButton(text="Реферальная подписка", callback_data="subscription:referral")]
     ])
     return keyboard
+
 
 def get_tariffs_keyboard():
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[])
@@ -136,12 +152,14 @@ def get_tariffs_keyboard():
         )])
     return keyboard
 
+
 def get_exchange_keyboard():
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="BingX", callback_data="exchange:bingx"),
          types.InlineKeyboardButton(text="OKX", callback_data="exchange:okx")]
     ])
     return keyboard
+
 
 def get_main_menu(user_id):
     buttons = [[types.KeyboardButton(text="Подключить API")]]
@@ -151,6 +169,7 @@ def get_main_menu(user_id):
         buttons.append([types.KeyboardButton(text="Информация о подписке")])
     keyboard = types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=False)
     return keyboard
+
 
 async def is_bot_in_group():
     try:
@@ -164,10 +183,12 @@ async def is_bot_in_group():
         logging.error(f"Ошибка при проверке нахождения бота в группе: {e}")
         return False
 
+
 VIDEO_INSTRUCTIONS = {
     'bingx': 'videos/bingx_instruction.mp4',
     'okx': 'videos/okx_instruction.mp4'
 }
+
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -184,7 +205,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     if not result:
         await message.answer(
-            "Данный бот предоставляет вам возможность пользоваться автоматизированной версией нашей торговой стратегии без надобности выходить за пределы Telegram." 
+            "Данный бот предоставляет вам возможность пользоваться автоматизированной версией нашей торговой стратегии без надобности выходить за пределы Telegram."
             "Вам остается лишь один раз провести небольшую настройку, после чего вы сможете пользоваться стратегией и с помощью этого бота."
             "Для начала вам нужно выбрать тип вашей подписки",
             reply_markup=get_subscription_type_keyboard()
@@ -210,6 +231,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 reply_markup=get_tariffs_keyboard()
             )
             await state.set_state(PaymentStates.waiting_for_payment)
+
 
 @router.callback_query(F.data.startswith("subscription:"))
 async def process_subscription_type(callback_query: types.CallbackQuery, state: FSMContext):
@@ -241,8 +263,8 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
         await state.set_state(PaymentStates.waiting_for_exchange)
     else:
         cursor.execute(
-            "INSERT INTO users (user_id, subscription_type) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s",
-            (user_id, "regular", "regular")
+            "INSERT INTO users (user_id, chat_id, subscription_type) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET chat_id = %s, subscription_type = %s",
+            (user_id, user_id, "regular", user_id, "regular")
         )
         conn.commit()
         await callback_query.message.edit_text(
@@ -251,6 +273,7 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
         )
         await state.update_data(subscription_type="regular")
         await state.set_state(PaymentStates.waiting_for_payment)
+
 
 @router.callback_query(F.data.startswith("exchange:"))
 async def process_exchange(callback_query: types.CallbackQuery, state: FSMContext):
@@ -351,6 +374,7 @@ async def process_exchange(callback_query: types.CallbackQuery, state: FSMContex
                 text=f"Не удалось отправить сообщение пользователю {user_id} из-за ошибки: {e}"
             )
 
+
 @router.message(PaymentStates.waiting_for_referral_uuid)
 async def process_referral_uuid(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -368,7 +392,8 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
     if result and result['subscription_type'] == "referral_pending":
         await message.answer("⏳ Ваш предыдущий UUID ещё на модерации. Пожалуйста, дождитесь ответа.")
         return
-    elif result and result['subscription_type'] == "referral_approved" and result['subscription_end'] > datetime.datetime.now():
+    elif result and result['subscription_type'] == "referral_approved" and result[
+        'subscription_end'] > datetime.datetime.now():
         if result['api_key']:
             await message.answer(
                 "✅ У вас уже есть активная реферальная подписка и подключённый API. Выберите действие:",
@@ -383,8 +408,9 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
         return
 
     cursor.execute(
-        "INSERT INTO users (user_id, subscription_type, referral_uuid, exchange) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s, referral_uuid = %s, exchange = %s",
-        (user_id, "referral_pending", referral_uuid, exchange, "referral_pending", referral_uuid, exchange)
+        "INSERT INTO users (user_id, chat_id, subscription_type, referral_uuid, exchange) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET chat_id = %s, subscription_type = %s, referral_uuid = %s, exchange = %s",
+        (user_id, user_id, "referral_pending", referral_uuid, exchange, user_id, "referral_pending", referral_uuid,
+         exchange)
     )
     conn.commit()
 
@@ -409,6 +435,7 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
         logging.error(f"Ошибка отправки UUID модератору: {e}")
         await message.answer("❌ Ошибка при отправке UUID. Попробуйте позже.")
         await state.clear()
+
 
 @router.callback_query(F.data.startswith("approve_uuid:") | F.data.startswith("reject_uuid:"))
 async def process_moderator_decision(callback_query: types.CallbackQuery, state: FSMContext):
@@ -495,6 +522,7 @@ async def process_moderator_decision(callback_query: types.CallbackQuery, state:
         logging.error(f"Error processing moderator decision for callback {callback_query.data}: {e}")
         await callback_query.message.edit_text("❌ Ошибка при обработке решения. Попробуйте снова.")
 
+
 @router.message(F.text == "Подключить API")
 async def connect_api(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -508,7 +536,8 @@ async def connect_api(message: types.Message, state: FSMContext):
         await message.answer("⏳ Ваш UUID на модерации. Пожалуйста, дождитесь подтверждения.")
         return
 
-    if result and result['subscription_type'] == "referral_approved" and result['subscription_end'] > datetime.datetime.now():
+    if result and result['subscription_type'] == "referral_approved" and result[
+        'subscription_end'] > datetime.datetime.now():
         if result['api_key']:
             await message.answer(
                 "✅ У вас уже подключен API. Вы можете проверить информацию о подписке или связаться с поддержкой для изменения ключей.",
@@ -516,7 +545,8 @@ async def connect_api(message: types.Message, state: FSMContext):
             )
             await state.clear()
             return
-        if current_state in [PaymentStates.waiting_for_api_key, PaymentStates.waiting_for_secret_key, PaymentStates.waiting_for_passphrase]:
+        if current_state in [PaymentStates.waiting_for_api_key, PaymentStates.waiting_for_secret_key,
+                             PaymentStates.waiting_for_passphrase]:
             if current_state == PaymentStates.waiting_for_api_key:
                 await message.answer('''
 Для того, чтобы успешно провести автоматизацию, вам нужно будет прислать api ключ и secret key с вашей биржи. 
@@ -539,20 +569,23 @@ async def connect_api(message: types.Message, state: FSMContext):
         )
         await state.set_state(PaymentStates.waiting_for_subscription_type)
 
+
 @router.message(F.text == "Информация о подписке")
 async def subscription_info(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     current_state = await state.get_state()
     logging.info(f"Processing 'Информация о подписке' for user {user_id}, current state: {current_state}")
 
-    cursor.execute("SELECT subscription_end, subscription_type, api_key, exchange FROM users WHERE user_id = %s", (user_id,))
+    cursor.execute("SELECT subscription_end, subscription_type, api_key, exchange FROM users WHERE user_id = %s",
+                   (user_id,))
     result = cursor.fetchone()
 
     if result and result['subscription_type'] == "referral_pending":
         await message.answer("⏳ Ваш UUID на модерации. Пожалуйста, дождитесь подтверждения.")
         return
 
-    if result and result['subscription_type'] == "referral_approved" and result['subscription_end'] is not None and result['subscription_end'] > datetime.datetime.now():
+    if result and result['subscription_type'] == "referral_approved" and result['subscription_end'] is not None and \
+            result['subscription_end'] > datetime.datetime.now():
         subscription_end = result['subscription_end']
         subscription_type = result['subscription_type']
         api_status = "Подключен" if result['api_key'] else "Не подключен"
@@ -574,6 +607,7 @@ async def subscription_info(message: types.Message, state: FSMContext):
         )
         await state.set_state(PaymentStates.waiting_for_subscription_type)
 
+
 @router.message(PaymentStates.waiting_for_api_key)
 async def process_api_key(message: types.Message, state: FSMContext):
     api_key = message.text.strip()
@@ -583,7 +617,8 @@ async def process_api_key(message: types.Message, state: FSMContext):
 
     if not exchange:
         logging.error(f"No exchange selected for user {user_id}")
-        await message.answer("Ошибка: биржа не выбрана. Пожалуйста, выберите биржу:", reply_markup=get_exchange_keyboard())
+        await message.answer("Ошибка: биржа не выбрана. Пожалуйста, выберите биржу:",
+                             reply_markup=get_exchange_keyboard())
         return
 
     if len(api_key) < 10:
@@ -595,6 +630,7 @@ async def process_api_key(message: types.Message, state: FSMContext):
     await state.update_data(api_key=api_key)
     await message.answer("Введите ваш Secret Key:")
     await state.set_state(PaymentStates.waiting_for_secret_key)
+
 
 @router.message(PaymentStates.waiting_for_secret_key)
 async def process_secret_key(message: types.Message, state: FSMContext):
@@ -617,8 +653,8 @@ async def process_secret_key(message: types.Message, state: FSMContext):
         await state.set_state(PaymentStates.waiting_for_passphrase)
     else:
         cursor.execute(
-            "UPDATE users SET api_key = %s, secret_key = %s, passphrase = NULL, exchange = %s WHERE user_id = %s",
-            (api_key, secret_key, exchange, user_id)
+            "UPDATE users SET api_key = %s, secret_key = %s, passphrase = NULL, exchange = %s, chat_id = %s WHERE user_id = %s",
+            (api_key, secret_key, exchange, user_id, user_id)
         )
         conn.commit()
         await message.answer(
@@ -627,6 +663,7 @@ async def process_secret_key(message: types.Message, state: FSMContext):
         )
         await state.clear()
         logging.info(f"API keys successfully saved for user {user_id}, exchange: {exchange}")
+
 
 @router.message(PaymentStates.waiting_for_passphrase)
 async def process_passphrase(message: types.Message, state: FSMContext):
@@ -639,13 +676,14 @@ async def process_passphrase(message: types.Message, state: FSMContext):
 
     if len(passphrase) < 8:
         logging.warning(f"Invalid Passphrase length for user {user_id}: {passphrase}")
-        await message.answer("❌ Неверный формат Passphrase. Пожалуйста, введите корректный Passphrase (минимум 8 символов):")
+        await message.answer(
+            "❌ Неверный формат Passphrase. Пожалуйста, введите корректный Passphrase (минимум 8 символов):")
         return
 
     logging.info(f"Passphrase received for user {user_id}: {passphrase}")
     cursor.execute(
-        "UPDATE users SET api_key = %s, secret_key = %s, passphrase = %s, exchange = %s WHERE user_id = %s",
-        (api_key, secret_key, passphrase, exchange, user_id)
+        "UPDATE users SET api_key = %s, secret_key = %s, passphrase = %s, exchange = %s, chat_id = %s WHERE user_id = %s",
+        (api_key, secret_key, passphrase, exchange, user_id, user_id)
     )
     conn.commit()
 
@@ -656,6 +694,7 @@ async def process_passphrase(message: types.Message, state: FSMContext):
     await state.clear()
     logging.info(f"API keys and passphrase successfully saved for user {user_id}, exchange: {exchange}")
 
+
 @router.callback_query(F.data == "cancel")
 async def cancel_action(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.message.delete()
@@ -665,6 +704,7 @@ async def cancel_action(callback_query: types.CallbackQuery, state: FSMContext):
         reply_markup=get_main_menu(callback_query.from_user.id)
     )
     await state.clear()
+
 
 @router.message(lambda message: message.text not in ["Подключить API", "Информация о подписке"])
 async def handle_invalid_input(message: types.Message, state: FSMContext):
@@ -687,7 +727,8 @@ async def handle_invalid_input(message: types.Message, state: FSMContext):
     elif current_state == PaymentStates.waiting_for_referral_uuid:
         await process_referral_uuid(message, state)
         return
-    elif result and result['subscription_type'] == "referral_approved" and result['subscription_end'] > datetime.datetime.now():
+    elif result and result['subscription_type'] == "referral_approved" and result[
+        'subscription_end'] > datetime.datetime.now():
         await message.answer(
             "✅ У вас есть активная подписка. Выберите действие:",
             reply_markup=get_main_menu(user_id)
@@ -699,6 +740,38 @@ async def handle_invalid_input(message: types.Message, state: FSMContext):
             reply_markup=get_main_menu(user_id)
         )
         await state.clear()
+
+
+async def send_signal_notification(signal: dict, user_id: int):
+    """Отправляет уведомление о новом сигнале пользователю."""
+    action = signal['action']
+    symbol = signal['symbol']
+    price = signal['price']
+    stop_loss = signal['stop_loss']
+    take_profits = [signal.get('take_profit_1'), signal.get('take_profit_2'), signal.get('take_profit_3')]
+
+    tp1, tp2, tp3 = take_profits
+    message = (
+        f"🔔 <b>Открыт сигнал</b>\n"
+        f"📊 Пара: {symbol}\n"
+        f"💰 Цена входа: {price}\n"
+        f"🎯 Тейк-профит 1: {tp1}\n"
+        f"🎯 Тейк-профит 2: {tp2}\n"
+        f"🎯 Тейк-профит 3: {tp3}\n"
+        f"🛑 Стоп-лосс: {stop_loss}\n\n"
+        f"Пожалуйста, проверьте, все ли открыто на бирже. Если возникли проблемы с открытием, напишите в поддержку!"
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=message,
+            parse_mode="HTML"
+        )
+        logging.info(f"Уведомление о сигнале отправлено пользователю {user_id}")
+    except Exception as e:
+        logging.error(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+
 
 async def check_subscriptions():
     while True:
@@ -726,6 +799,7 @@ async def check_subscriptions():
                 logging.error(f"Error processing expired subscription for user {user_id}: {processing_error}")
         await asyncio.sleep(3600)
 
+
 async def main():
     is_in_group = await is_bot_in_group()
     if not is_in_group:
@@ -735,6 +809,7 @@ async def main():
 
     asyncio.create_task(check_subscriptions())
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
