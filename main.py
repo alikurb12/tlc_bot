@@ -98,11 +98,9 @@ if not cursor.fetchone():
 conn.commit()
 
 TARIFFS = {
-    'test': {'days': 1, 'price': 5, 'name': 'Тестовый (1 день)'},
-    '1month': {'days': 30, 'price': 70, 'name': '1 месяц'},
-    '3months': {'days': 90, 'price': 160, 'name': '3 месяца (Выгода 50$)'},
-    '6months': {'days': 180, 'price': 320, 'name': '6 месяцев (Выгода 100$)'},
-    '12months': {'days': 365, 'price': 640, 'name': '12 месяцев (Выгода 200$)'}
+    'test': {'days': 1, 'price': 1, 'name': 'Тестовый (1 день)'},
+    '1month': {'days': 30, 'price': 30, 'name': '1 месяц'},
+    '3months': {'days': 90, 'price': 70, 'name': '3 месяца'},
 }
 
 
