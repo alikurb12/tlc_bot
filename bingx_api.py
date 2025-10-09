@@ -69,7 +69,7 @@ def set_leverage(symbol: str, leverage: int=5, position_side: str="LONG", api_ke
         raise
 
 
-def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.10, api_key: str = None,
+def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.05, api_key: str = None,
                        secret_key: str = None) -> float:
     try:
         balance_response = get_balance(api_key, secret_key)
@@ -190,3 +190,22 @@ def parseParam(paramsMap: dict) -> str:
     sortedKeys = sorted(paramsMap)
     paramsStr = "&".join(["%s=%s" % (x, paramsMap[x]) for x in sortedKeys])
     return paramsStr + "&timestamp=" + str(int(time.time() * 1000)) if paramsStr else "timestamp=" + str(int(time.time() * 1000))
+
+def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str) -> bool:
+    try:
+        path = '/openApi/swap/v2/trade/order'
+        method = "DELETE"
+        paramsMap = {
+            "symbol": symbol,
+            "orderId": order_id
+        }
+        paramsStr = parseParam(paramsMap)
+        response = send_request(method, path, paramsStr, {}, api_key, secret_key)
+        response_data = json.loads(response)
+        if response_data.get("code") != 0:
+            raise ValueError(f"Ошибка отмены ордера: {response_data.get('msg')}")
+        logger.info(f"Ордер {order_id} для {symbol} успешно отменён")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
+        raise

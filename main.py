@@ -925,28 +925,40 @@ async def handle_invalid_input(message: types.Message, state: FSMContext):
         )
         await state.clear()
 
+# Заменяем функцию send_signal_notification в main.py
+
 async def send_signal_notification(signal: dict, user_id: int):
-    """Отправляет уведомление о новом сигнале пользователю."""
+    """Отправляет уведомление о новом сигнале или закрытии сделки пользователю."""
     action = signal['action']
     symbol = signal['symbol']
     price = signal['price']
     stop_loss = signal['stop_loss']
     take_profits = [signal.get('take_profit_1'), signal.get('take_profit_2'), signal.get('take_profit_3')]
 
-    tp1, tp2, tp3 = take_profits
-    message = (
-        f"🔔 <b>Открыт сигнал</b>\n"
-        f"📊 Пара: {symbol}\n"
-        f"💰 Цена входа: {price}\n"
-        f"🎯 Тейк-профит 1: {tp1}\n"
-        f"🎯 Тейк-профит 2: {tp2}\n"
-        f"🎯 Тейк-профит 3: {tp3}\n"
-        f"🛑 Стоп-лосс: {stop_loss}\n\n"
-        f"Пожалуйста, проверьте, все ли открыто на бирже. Если возникли проблемы с открытием, напишите в поддержку!"
-    )
+    SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@SupportBot")
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
     ])
+
+    if action.startswith("CLOSE_"):
+        side = action.split("_")[1]
+        message = (
+            f"🔔 <b>Сделка {side} закрыта</b>\n"
+            f"📊 Пара: {symbol}\n"
+            f"Пожалуйста, проверьте статус на бирже. Если возникли проблемы, свяжитесь с поддержкой!"
+        )
+    else:
+        tp1, tp2, tp3 = take_profits
+        message = (
+            f"🔔 <b>Открыт сигнал</b>\n"
+            f"📊 Пара: {symbol}\n"
+            f"💰 Цена входа: {price}\n"
+            f"🎯 Тейк-профит 1: {tp1}\n"
+            f"🎯 Тейк-профит 2: {tp2}\n"
+            f"🎯 Тейк-профит 3: {tp3}\n"
+            f"🛑 Стоп-лосс: {stop_loss}\n\n"
+            f"Пожалуйста, проверьте, все ли открыто на бирже. Если возникли проблемы, напишите в поддержку!"
+        )
 
     try:
         await bot.send_message(
@@ -955,9 +967,9 @@ async def send_signal_notification(signal: dict, user_id: int):
             parse_mode="HTML",
             reply_markup=keyboard
         )
-        logging.info(f"Уведомление о сигнале отправлено пользователю {user_id}")
+        logger.info(f"Уведомление отправлено пользователю {user_id}: {action}")
     except Exception as e:
-        logging.error(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+        logger.error(f"Ошибка отправки уведомления пользователю {user_id}: {str(e)}")
 
 async def check_subscriptions():
     while True:

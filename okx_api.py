@@ -196,3 +196,47 @@ def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float,
     except Exception as e:
         logger.error(f"Ошибка при создании основного ордера для {symbol}: {str(e)}")
         raise
+
+# Добавляем в конец okx_api.py
+
+def get_order_status(symbol: str, order_id: str, api_key: str, secret_key: str, passphrase: str) -> dict:
+    try:
+        trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
+        response = trade_api.get_order(instId=symbol, ordId=order_id)
+        logger.info(f"Ответ API статуса ордера OKX: {json.dumps(response, indent=2)}")
+        if response.get("code") != "0":
+            raise ValueError(f"Ошибка получения статуса ордера: {response.get('msg')}")
+        return response["data"][0]
+    except Exception as e:
+        logger.error(f"Ошибка при получении статуса ордера {order_id} для {symbol}: {str(e)}")
+        raise
+
+def close_position(symbol: str, posSide: str, api_key: str, secret_key: str, passphrase: str) -> bool:
+    try:
+        trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
+        response = trade_api.close_positions(
+            instId=symbol,
+            mgnMode="isolated",
+            posSide=posSide
+        )
+        logger.info(f"Ответ API закрытия позиции OKX: {json.dumps(response, indent=2)}")
+        if response.get("code") != "0":
+            raise ValueError(f"Ошибка закрытия позиции: {response.get('msg')}")
+        logger.info(f"Позиция {posSide} для {symbol} успешно закрыта")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии позиции {posSide} для {symbol}: {str(e)}")
+        raise
+
+def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str, passphrase: str) -> bool:
+    try:
+        trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
+        response = trade_api.cancel_order(instId=symbol, ordId=order_id)
+        logger.info(f"Ответ API отмены ордера OKX: {json.dumps(response, indent=2)}")
+        if response.get("code") != "0":
+            raise ValueError(f"Ошибка отмены ордера: {response.get('msg')}")
+        logger.info(f"Ордер {order_id} для {symbol} успешно отменён")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
+        raise
