@@ -555,7 +555,7 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
     elif result and result['subscription_type'] == "referral_approved" and result['subscription_end'] > datetime.datetime.now():
         if result['api_key']:
             await message.answer(
-                "✅ У вас уже есть активная реферальная подписка и подключённый API. Выберите действие:",
+                "✅ У вас уже есть активная реферальная подписка и подключённая автоторговля. Выберите действие:",
                 reply_markup=get_main_menu(user_id)
             )
         else:
@@ -838,7 +838,7 @@ async def process_secret_key(message: types.Message, state: FSMContext):
         )
         conn.commit()
         await message.answer(
-            "✅ API-ключ успешно добавлен!",
+            "✅ Вы успешно подключили автоторговлю!",
             reply_markup=get_main_menu(user_id)
         )
         await state.clear()
@@ -967,9 +967,9 @@ async def send_signal_notification(signal: dict, user_id: int):
             parse_mode="HTML",
             reply_markup=keyboard
         )
-        logger.info(f"Уведомление отправлено пользователю {user_id}: {action}")
+        logging.info(f"Уведомление отправлено пользователю {user_id}: {action}")
     except Exception as e:
-        logger.error(f"Ошибка отправки уведомления пользователю {user_id}: {str(e)}")
+        logging.error(f"Ошибка отправки уведомления пользователю {user_id}: {str(e)}")
 
 async def check_subscriptions():
     while True:
