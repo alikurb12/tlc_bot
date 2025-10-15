@@ -1,12 +1,10 @@
-import os
 import time
 import json
 import logging
 import asyncio
-from typing import Dict, Optional
-
 from aiogram import types
-
+import os
+from typing import Dict, Optional
 from database import get_cursor, commit
 from main import bot, send_signal_notification
 from bingx_api import (
@@ -16,7 +14,9 @@ from bingx_api import (
     create_main_order as bingx_create_main_order,
     create_tp_sl_orders as bingx_create_tp_sl_orders,
     get_open_orders as bingx_get_open_orders,
-    cancel_order as bingx_cancel_order
+    cancel_order as bingx_cancel_order,
+    close_position as bingx_close_position,
+    get_open_positions as bingx_get_open_positions
 )
 from okx_api import (
     get_balance as okx_get_balance,
@@ -25,11 +25,10 @@ from okx_api import (
     create_main_order as okx_create_main_order,
     cancel_order as okx_cancel_order,
     get_order_status,
-    close_position
+    close_position as okx_close_position
 )
 
 logger = logging.getLogger(__name__)
-
 
 def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
     user_id = user['user_id']
@@ -52,53 +51,88 @@ def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
         )
         open_trades = cursor.fetchall()
 
-        if not open_trades:
-            logger.info(f"Нет открытых сделок для пользователя {user_id} по символу {symbol}")
-            return False
-
         closed = False
+        position_side = "LONG" if current_side == "SELL" else "SHORT"  # Противоположная сторона
+
+        # Отменяем все связанные ордера
         for trade in open_trades:
-            if trade['side'] != current_side:  # Проверяем противоположную сторону
+            if trade['side'] != current_side:
                 order_ids = [trade['order_id'], trade['sl_order_id'], trade['tp1_order_id'],
                              trade['tp2_order_id'], trade['tp3_order_id']]
                 for order_id in order_ids:
                     if order_id:
                         try:
                             bingx_cancel_order(symbol, order_id, api_key, secret_key)
+                            logger.info(f"Ордер {order_id} для {symbol} успешно отменён")
                             closed = True
                         except Exception as e:
-                            logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
-                            continue
+                            if "order not exist" in str(e).lower():
+                                logger.info(f"Ордер {order_id} для {symbol} уже не существует")
+                            else:
+                                logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
+                                continue
 
-                cursor.execute(
-                    "UPDATE trades SET status = %s WHERE trade_id = %s",
-                    ('closed', trade['trade_id'])
+        # Закрываем позицию (в режиме хеджирования без reduceOnly)
+        try:
+            bingx_close_position(symbol, position_side, api_key, secret_key)
+            logger.info(f"Позиция {position_side} для {symbol} закрыта")
+            closed = True
+        except Exception as e:
+            if "position not exist" in str(e).lower() or "order not exist" in str(e).lower():
+                logger.info(f"Позиция {position_side} для {symbol} уже не существует")
+            else:
+                logger.error(f"Ошибка при закрытии позиции {position_side} для {symbol}: {str(e)}")
+
+        # Обновляем статус в базе данных для всех открытых сделок противоположной стороны
+        cursor.execute(
+            """
+            UPDATE trades SET status = %s
+            WHERE user_id = %s AND symbol = %s AND status = %s AND side != %s
+            """,
+            ('closed', user_id, symbol, 'open', current_side)
+        )
+        commit()
+
+        if closed:
+            # Отправляем уведомление о закрытии сделки
+            try:
+                notification = {
+                    "action": f"CLOSE_{'BUY' if position_side == 'LONG' else 'SELL'}",
+                    "symbol": symbol,
+                    "price": 0,
+                    "stop_loss": None,
+                    "take_profit_1": None,
+                    "take_profit_2": None,
+                    "take_profit_3": None
+                }
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    send_signal_notification(notification, user_id), loop
                 )
-                commit()
-
-                # Отправляем уведомление о закрытии сделки
-                try:
-                    notification = {
-                        "action": f"CLOSE_{trade['side']}",
-                        "symbol": symbol,
-                        "price": 0,  # Цена закрытия неизвестна, ставим 0
-                        "stop_loss": None,
-                        "take_profit_1": None,
-                        "take_profit_2": None,
-                        "take_profit_3": None
-                    }
-                    loop = asyncio.get_event_loop()
-                    asyncio.run_coroutine_threadsafe(
-                        send_signal_notification(notification, user_id), loop
-                    )
-                    logger.info(f"Уведомление о закрытии сделки отправлено для пользователя {user_id}")
-                except Exception as notify_error:
-                    logger.error(f"Ошибка отправки уведомления о закрытии для {user_id}: {notify_error}")
+                logger.info(f"Уведомление о закрытии сделки отправлено для пользователя {user_id}")
+            except Exception as notify_error:
+                logger.error(f"Ошибка отправки уведомления о закрытии для {user_id}: {notify_error}")
 
         return closed
 
     except Exception as e:
         logger.error(f"Ошибка при закрытии сделки BingX для пользователя {user_id}: {str(e)}")
+        SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@SupportBot")
+        try:
+            keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+            ])
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ Не удалось закрыть предыдущую сделку по {symbol}. Пожалуйста, проверьте биржу и свяжитесь с поддержкой.",
+                    reply_markup=keyboard
+                ),
+                loop
+            )
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления об ошибке закрытия для {user_id}: {notify_error}")
         return False
 
 
@@ -127,9 +161,9 @@ def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
         closed = False
         for trade in open_trades:
             if trade['side'] != current_side:  # Проверяем противоположную сторону
+                pos_side = "long" if trade['side'] == "BUY" else "short"
                 order_ids = [trade['order_id'], trade['sl_order_id'], trade['tp1_order_id'],
                              trade['tp2_order_id'], trade['tp3_order_id']]
-                pos_side = "long" if trade['side'] == "BUY" else "short"
 
                 # Проверяем статус ордеров
                 for order_id in order_ids:
@@ -146,9 +180,9 @@ def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
                             logger.error(f"Ошибка при проверке/отмене ордера {order_id} для {symbol}: {str(e)}")
                             continue
 
-                # Проверяем и закрываем позицию
+                # Закрываем позицию
                 try:
-                    close_position(symbol, pos_side, api_key, secret_key, passphrase)
+                    okx_close_position(symbol, pos_side, api_key, secret_key, passphrase)
                     closed = True
                 except Exception as e:
                     logger.warning(f"Не удалось закрыть позицию {pos_side} для {symbol}: {str(e)}")
@@ -165,7 +199,7 @@ def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
                     notification = {
                         "action": f"CLOSE_{trade['side']}",
                         "symbol": symbol,
-                        "price": 0,  # Цена закрытия неизвестна
+                        "price": 0,
                         "stop_loss": None,
                         "take_profit_1": None,
                         "take_profit_2": None,
@@ -217,6 +251,17 @@ def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     try:
         # Проверяем и закрываем противоположные открытые сделки
         close_bingx_trade(user, symbol, action)
+
+        # Проверяем открытые позиции
+        open_positions = bingx_get_open_positions(symbol, api_key, secret_key)
+        for position in open_positions:
+            pos_side = position.get("positionSide")
+            if pos_side and pos_side != position_side:
+                try:
+                    bingx_close_position(symbol, pos_side, api_key, secret_key)
+                    logger.info(f"Закрыта существующая позиция {pos_side} для {symbol}")
+                except Exception as e:
+                    logger.error(f"Ошибка при закрытии существующей позиции {pos_side} для {symbol}: {str(e)}")
 
         balance_response = bingx_get_balance(api_key, secret_key)
         balance_data = json.loads(balance_response)

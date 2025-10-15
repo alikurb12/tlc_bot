@@ -8,13 +8,31 @@ import logging
 logger = logging.getLogger(__name__)
 
 APIURL = "https://open-api.bingx.com"
+TIME_OFFSET = 0
+
+def get_server_time() -> int:
+    try:
+        url = f"{APIURL}/openApi/swap/v2/server/time"
+        response = requests.get(url)
+        data = response.json()
+        if 'code' in data and data['code'] == 0:
+            server_time = int(data['data']['serverTime'])
+            local_time = int(time.time() * 1000)
+            offset = server_time - local_time
+            logger.info(f"Синхронизация времени: server_time={server_time}, local_time={local_time}, offset={offset} ms")
+            return offset
+        else:
+            raise ValueError(f"Ошибка получения времени сервера: {data.get('msg')}")
+    except Exception as e:
+        logger.error(f"Ошибка при получении времени сервера: {str(e)}")
+        return 0
 
 def get_balance(api_key: str, secret_key: str) -> str:
     path = '/openApi/swap/v2/user/balance'
     method = "GET"
     paramsMap = {}
-    paramsSrt = parseParam(paramsMap)
-    return send_request(method, path, paramsSrt, {}, api_key, secret_key)
+    paramsStr = parseParam(paramsMap)
+    return send_request(method, path, paramsStr, {}, api_key, secret_key)
 
 def get_current_price(symbol: str) -> float:
     try:
@@ -58,16 +76,15 @@ def set_leverage(symbol: str, leverage: int=5, position_side: str="LONG", api_ke
             "side": position_side,
         }
         paramsStr = parseParam(paramsMap)
-        responce = send_request(method, path, paramsStr, {}, api_key, secret_key)
-        responce_data = json.loads(responce)
-        if responce_data.get("code")!=0:
-            raise ValueError(f"Ошибка установления плеча: {responce_data.get('msg')}")
+        response = send_request(method, path, paramsStr, {}, api_key, secret_key)
+        response_data = json.loads(response)
+        if response_data.get("code") != 0:
+            raise ValueError(f"Ошибка установления плеча: {response_data.get('msg')}")
         logger.info(f"Плечо {leverage} установлено для {symbol} side = {position_side}")
         return True
     except Exception as e:
-        logger.error(f"Ошибка при установке плеча для {symbol} side={position_side}")
+        logger.error(f"Ошибка при установке плеча для {symbol} side={position_side}: {str(e)}")
         raise
-
 
 def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.05, api_key: str = None,
                        secret_key: str = None) -> float:
@@ -102,7 +119,6 @@ def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.0
         logger.error(f"Ошибка при расчете количества: {str(e)}")
         raise
 
-
 def create_main_order(symbol: str, side: str, quantity: float, api_key: str, secret_key: str) -> str:
     path = '/openApi/swap/v2/trade/order'
     method = "POST"
@@ -115,7 +131,6 @@ def create_main_order(symbol: str, side: str, quantity: float, api_key: str, sec
     }
     paramsStr = parseParam(paramsMap)
     return send_request(method, path, paramsStr, {}, api_key, secret_key)
-
 
 def create_tp_sl_orders(symbol: str, side: str, quantity: float, stop_loss: float, take_profits: list, api_key: str,
                         secret_key: str):
@@ -130,17 +145,23 @@ def create_tp_sl_orders(symbol: str, side: str, quantity: float, stop_loss: floa
     }
     orders.append(stop_order)
 
-    tp_quantities = [quantity / 3, quantity / 3, quantity / 3]
+    current_price = get_current_price(symbol)
     sorted_take_profits = sorted(take_profits) if side == "BUY" else sorted(take_profits, reverse=True)
 
-    for i, (tp_price, tp_qty) in enumerate(zip(sorted_take_profits, tp_quantities)):
+    for tp_price in sorted_take_profits:
         if tp_price is not None:
+            if side == "BUY" and tp_price <= current_price:
+                logger.warning(f"Пропущен TP ордер для {symbol}: TP цена {tp_price} ниже текущей цены {current_price}")
+                continue
+            if side == "SELL" and tp_price >= current_price:
+                logger.warning(f"Пропущен TP ордер для {symbol}: TP цена {tp_price} выше текущей цены {current_price}")
+                continue
             tp_order = {
                 "symbol": symbol,
                 "side": "SELL" if side == "BUY" else "BUY",
                 "positionSide": "LONG" if side == "BUY" else "SHORT",
                 "type": "TAKE_PROFIT_MARKET",
-                "quantity": round(tp_qty, 3),
+                "quantity": round(quantity, 3),
                 "stopPrice": tp_price
             }
             orders.append(tp_order)
@@ -155,11 +176,12 @@ def create_tp_sl_orders(symbol: str, side: str, quantity: float, stop_loss: floa
         if response_data.get("code") == 0:
             order_id = response_data["data"]["order"]["orderId"]
             order_ids.append(order_id)
+        else:
+            logger.error(f"Ошибка создания TP/SL ордера: {response_data.get('msg')}")
         results.append(response)
         logger.info(f"TP/SL ордер response: {response}")
 
     return results, sorted_take_profits, order_ids
-
 
 def get_open_orders(symbol: str, api_key: str, secret_key: str) -> dict:
     try:
@@ -173,23 +195,6 @@ def get_open_orders(symbol: str, api_key: str, secret_key: str) -> dict:
     except Exception as e:
         logger.error(f"Ошибка при получении открытых ордеров: {str(e)}")
         raise
-
-def get_sign(api_secret: str, payload: str) -> str:
-    signature = hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), digestmod=sha256).hexdigest()
-    logger.info("sign=%s", signature)
-    return signature
-
-def send_request(method: str, path: str, urlpa: str, payload: dict, api_key: str, secret_key: str) -> str:
-    url = f"{APIURL}{path}?{urlpa}&signature={get_sign(secret_key, urlpa)}"
-    logger.info("Request URL: %s", url)
-    headers = {'X-BX-APIKEY': api_key}
-    response = requests.request(method, url, headers=headers, data=payload)
-    return response.text
-
-def parseParam(paramsMap: dict) -> str:
-    sortedKeys = sorted(paramsMap)
-    paramsStr = "&".join(["%s=%s" % (x, paramsMap[x]) for x in sortedKeys])
-    return paramsStr + "&timestamp=" + str(int(time.time() * 1000)) if paramsStr else "timestamp=" + str(int(time.time() * 1000))
 
 def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str) -> bool:
     try:
@@ -209,3 +214,101 @@ def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str) -> b
     except Exception as e:
         logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
         raise
+
+
+def close_position(symbol: str, position_side: str, api_key: str, secret_key: str) -> bool:
+    try:
+        # Получаем открытые позиции
+        open_positions = get_open_positions(symbol, api_key, secret_key)
+        positionAmt = 0.0
+
+        for position in open_positions:
+            if position.get("positionSide") == position_side:
+                positionAmt = float(position.get("positionAmt", 0))
+                break
+
+        if positionAmt <= 0:
+            logger.info(f"Нет открытой позиции для {symbol} на стороне {position_side}")
+            return True
+
+        # В режиме хеджирования закрываем позицию противоположным ордером без reduceOnly
+        path = '/openApi/swap/v2/trade/order'
+        method = "POST"
+        paramsMap = {
+            "symbol": symbol,
+            "side": "SELL" if position_side == "LONG" else "BUY",
+            "positionSide": position_side,
+            "type": "MARKET",
+            "quantity": abs(positionAmt)  # Используем абсолютное значение
+        }
+        paramsStr = parseParam(paramsMap)
+        response = send_request(method, path, paramsStr, {}, api_key, secret_key)
+        response_data = json.loads(response)
+        if response_data.get("code") != 0:
+            raise ValueError(f"Ошибка закрытия позиции: {response_data.get('msg')}")
+        logger.info(f"Позиция {position_side} для {symbol} успешно закрыта")
+        return True
+    except Exception as e:
+        if "position not exist" in str(e).lower() or "order not exist" in str(e).lower():
+            logger.info(f"Позиция {position_side} для {symbol} уже не существует")
+            return True
+        logger.error(f"Ошибка при закрытии позиции {position_side} для {symbol}: {str(e)}")
+        raise
+
+def get_open_positions(symbol: str, api_key: str, secret_key: str) -> list:
+    try:
+        path = '/openApi/swap/v2/user/positions'
+        method = "GET"
+        paramsMap = {"symbol": symbol}
+        paramsStr = parseParam(paramsMap)
+        response = send_request(method, path, paramsStr, {}, api_key, secret_key)
+        response_data = json.loads(response)
+        logger.info(f"Open positions response: {response}")
+        if response_data.get("code") != 0:
+            raise ValueError(f"Ошибка получения позиций: {response_data.get('msg')}")
+        return response_data.get("data", [])
+    except Exception as e:
+        logger.error(f"Ошибка при получении открытых позиций для {symbol}: {str(e)}")
+        raise
+
+def get_sign(api_secret: str, payload: str) -> str:
+    signature = hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), digestmod=sha256).hexdigest()
+    logger.info("sign=%s", signature)
+    return signature
+
+def send_request(method: str, path: str, urlpa: str, payload: dict, api_key: str, secret_key: str, retries: int = 3) -> str:
+    global TIME_OFFSET
+    attempt = 0
+    while attempt < retries:
+        try:
+            url = f"{APIURL}{path}?{urlpa}&signature={get_sign(secret_key, urlpa)}"
+            logger.info("Request URL: %s", url)
+            headers = {'X-BX-APIKEY': api_key}
+            response = requests.request(method, url, headers=headers, data=payload)
+            response_data = response.json()
+            if response_data.get("code") in [109414, 109500] and "timestamp is invalid" in response_data.get("msg", "").lower():
+                logger.warning(f"Недопустимый timestamp, попытка {attempt + 1}/{retries}. Повторная синхронизация времени...")
+                TIME_OFFSET = get_server_time()
+                urlpa = urlpa.split("&timestamp=")[0] + "&timestamp=" + str(int(time.time() * 1000) + TIME_OFFSET)
+                attempt += 1
+                time.sleep(1)
+                continue
+            return response.text
+        except Exception as e:
+            logger.error(f"Ошибка запроса (попытка {attempt + 1}/{retries}): {str(e)}")
+            if attempt < retries - 1:
+                TIME_OFFSET = get_server_time()
+                urlpa = urlpa.split("&timestamp=")[0] + "&timestamp=" + str(int(time.time() * 1000) + TIME_OFFSET)
+                time.sleep(1)
+            attempt += 1
+    raise ValueError(f"Не удалось выполнить запрос после {retries} попыток")
+
+def parseParam(paramsMap: dict) -> str:
+    global TIME_OFFSET
+    if not hasattr(parseParam, 'TIME_OFFSET'):
+        parseParam.TIME_OFFSET = get_server_time()
+        TIME_OFFSET = parseParam.TIME_OFFSET
+    sortedKeys = sorted(paramsMap)
+    paramsStr = "&".join(["%s=%s" % (x, paramsMap[x]) for x in sortedKeys])
+    timestamp = int(time.time() * 1000) + TIME_OFFSET
+    return paramsStr + "&timestamp=" + str(timestamp) if paramsStr else "timestamp=" + str(timestamp)

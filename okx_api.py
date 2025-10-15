@@ -12,7 +12,7 @@ APIURL = "https://www.okx.com"
 
 def get_symbol_info(symbol: str, api_key: str, secret_key: str, passphrase: str) -> dict:
     try:
-        pub_api = PublicAPI(flag="0", domain=APIURL, debug=True)
+        pub_api = PublicAPI(flag ="0", domain=APIURL, debug=True)
         response = pub_api.get_instruments(instType="SWAP", instId=symbol)
         logger.info(f"Ответ API инструментов OKX: {json.dumps(response, indent=2)}")
         if response.get("code") != "0":
