@@ -5,6 +5,8 @@ from okx.Trade import TradeAPI
 from okx.Account import AccountAPI
 from okx.MarketData import MarketAPI
 
+from database import get_cursor, commit
+
 logger = logging.getLogger(__name__)
 
 APIURL = "https://www.okx.com"
@@ -230,7 +232,7 @@ def close_position(symbol: str, posSide: str, api_key: str, secret_key: str, pas
 
 def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str, passphrase: str) -> bool:
     try:
-        trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
+        trade_api = TradeAPI(api_key, secret_key, passphrase, flag="1", domain=APIURL, debug=True)
         response = trade_api.cancel_order(instId=symbol, ordId=order_id)
         logger.info(f"Ответ API отмены ордера OKX: {json.dumps(response, indent=2)}")
         if response.get("code") != "0":
@@ -239,4 +241,121 @@ def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str, pass
         return True
     except Exception as e:
         logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
+        raise
+
+
+def move_sl_to_breakeven(symbol: str, api_key: str, secret_key: str, passphrase: str) -> bool:
+    """
+    Перемещает стоп-лосс к цене входа для OKX
+    """
+    try:
+        trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
+        account_api = AccountAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
+
+        # Получаем открытые позиции
+        response = account_api.get_positions(instType="SWAP", instId=symbol)
+        if response.get("code") != "0":
+            raise ValueError(f"Ошибка получения позиций: {response.get('msg')}")
+
+        positions = response.get("data", [])
+
+        for position in positions:
+            pos_side = position.get("posSide")
+            position_amt = float(position.get("pos", 0))
+            avg_price = float(position.get("avgPx", 0))
+
+            if position_amt != 0 and avg_price > 0:
+                # Получаем pending ордера (включая алгоритмические)
+                orders_response = trade_api.get_order_list(instType="SWAP", instId=symbol, state="live")
+                if orders_response.get("code") != "0":
+                    raise ValueError(f"Ошибка получения ордеров: {orders_response.get('msg')}")
+
+                # Получаем алгоритмические ордера отдельно
+                algo_response = trade_api.get_order_list(
+                    ordType="conditional",
+                    instId=symbol,
+                    state="live"
+                )
+
+                logger.info(f"Алгоритмические ордера: {json.dumps(algo_response, indent=2)}")
+
+                # Ищем SL ордера (conditional ордера с slTriggerPx)
+                sl_orders = []
+                if algo_response.get("code") == "0":
+                    algo_orders = algo_response.get("data", [])
+                    sl_orders = [order for order in algo_orders
+                                 if order.get("slTriggerPx") and order.get("posSide") == pos_side]
+
+                # Отменяем старые SL ордера
+                for sl_order in sl_orders:
+                    algo_id = sl_order.get("algoId")
+                    if algo_id:
+                        cancel_response = trade_api.cancel_order(
+                            instId=symbol,
+                            ordId=sl_order.get("ordId"),
+                        )
+                        logger.info(f"Ответ отмены SL ордера: {json.dumps(cancel_response, indent=2)}")
+                        if cancel_response.get("code") == "0":
+                            logger.info(f"Старый SL ордер {algo_id} отменен")
+                        else:
+                            logger.warning(f"Не удалось отменить SL ордер {algo_id}: {cancel_response.get('msg')}")
+
+                # Создаем новый SL ордер по цене входа
+                quantity = abs(position_amt)
+                new_sl_price = avg_price
+
+                # Корректируем цену SL в зависимости от направления
+                if pos_side == "long":
+                    new_sl_price = avg_price * 0.999  # Чуть ниже для LONG
+                    side = "sell"
+                else:  # short
+                    new_sl_price = avg_price * 1.001  # Чуть выше для SHORT
+                    side = "buy"
+
+                # Создаем новый SL ордер
+                sl_order_params = {
+                    "instId": symbol,
+                    "tdMode": "isolated",
+                    "side": side,
+                    "posSide": pos_side,
+                    "ordType": "conditional",
+                    "sz": str(round(quantity, 2)),
+                    "slTriggerPx": str(round(new_sl_price, 4)),
+                    "slOrdPx": "-1",
+                    "tpTriggerPx": "",
+                    "tpOrdPx": "",
+                    "triggerPxType": "last"
+                }
+
+                logger.info(f"Создание нового SL ордера с параметрами: {sl_order_params}")
+
+                create_response = trade_api.place_algo_order(**sl_order_params)
+                logger.info(f"Ответ создания SL ордера: {json.dumps(create_response, indent=2)}")
+
+                if create_response.get("code") == "0":
+                    new_sl_algo_id = create_response["data"][0]["algoId"]
+                    logger.info(f"Новый SL ордер {new_sl_algo_id} создан по цене {new_sl_price}")
+
+                    # Обновляем базу данных
+                    cursor = get_cursor()
+                    cursor.execute(
+                        """
+                        UPDATE trades 
+                        SET stop_loss = %s, sl_order_id = %s 
+                        WHERE user_id = (SELECT user_id FROM users WHERE api_key = %s) 
+                        AND symbol = %s AND status = 'open'
+                        """,
+                        (new_sl_price, new_sl_algo_id, api_key, symbol)
+                    )
+                    commit()
+
+                    return True
+                else:
+                    raise ValueError(f"Ошибка создания нового SL ордера: {create_response.get('msg')}")
+
+        logger.info(f"Нет открытых позиций для {symbol} или позиция уже закрыта")
+        return True
+
+    except Exception as e:
+        logger.error(f"Ошибка при перемещении SL для {symbol} на OKX: {str(e)}")
         raise

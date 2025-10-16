@@ -5,11 +5,64 @@ from datetime import datetime
 from database import get_cursor
 from models import Signal
 from utils import normalize_symbol
-from services import process_bingx_signal, process_okx_signal
+from services import process_bingx_signal, process_okx_signal, process_bingx_move_sl, process_okx_move_sl
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+async def handle_move_sl_signal(data: dict):
+    """Обработка сигнала MOVE_SL"""
+    symbol = data.get('symbol')
+    if not symbol:
+        logger.error("Не указан символ для MOVE_SL")
+        raise HTTPException(status_code=400, detail="Необходимо указать символ для MOVE_SL")
+
+    cursor = get_cursor()
+    cursor.execute(
+        "SELECT user_id, api_key, secret_key, passphrase, exchange FROM users WHERE subscription_end > %s AND api_key IS NOT NULL AND secret_key IS NOT NULL AND subscription_type IN ('referral_approved', 'regular')",
+        (datetime.now(),)
+    )
+    active_users = cursor.fetchall()
+
+    if not active_users:
+        logger.error("Нет пользователей с активной подпиской и API-ключами")
+        raise HTTPException(status_code=400, detail="Нет пользователей с активной подпиской и API-ключами")
+
+    results = []
+    for user in active_users:
+        user_id = user['user_id']
+        exchange = user.get('exchange', 'bingx')
+        normalized_symbol = normalize_symbol(symbol, exchange)
+
+        try:
+            if exchange == 'bingx':
+                result = process_bingx_move_sl(user, normalized_symbol)
+            elif exchange == 'okx':
+                result = process_okx_move_sl(user, normalized_symbol)
+            else:
+                logger.error(f"Неизвестная биржа: {exchange} для пользователя {user_id}")
+                continue
+
+            if result:
+                results.append(result)
+                logger.info(f"MOVE_SL обработан для пользователя {user_id} на бирже {exchange}")
+
+        except Exception as e:
+            logger.error(f"Ошибка обработки MOVE_SL для пользователя {user_id} на бирже {exchange}: {str(e)}")
+            continue
+
+    if not results:
+        raise HTTPException(status_code=500, detail="Не удалось обработать MOVE_SL ни для одного пользователя")
+
+    return {
+        "status": "success",
+        "message": "MOVE_SL сигнал обработан для активных пользователей",
+        "symbol": symbol,
+        "results": results
+    }
+
 
 @router.post("/webhook")
 async def webhook(request: Request):
@@ -20,8 +73,10 @@ async def webhook(request: Request):
 
         content_type = request.headers.get('Content-Type', '').lower()
         if not content_type or 'application/json' not in content_type:
-            logger.error(f"Неверный Content-Type: {content_type}. Ожидается application/json от TradingView с {{strategy.order.alert_message}}")
-            raise HTTPException(status_code=400, detail="Ожидается Content-Type: application/json. Настройте TradingView для отправки JSON с {{strategy.order.alert_message}}")
+            logger.error(
+                f"Неверный Content-Type: {content_type}. Ожидается application/json от TradingView с {{strategy.order.alert_message}}")
+            raise HTTPException(status_code=400,
+                                detail="Ожидается Content-Type: application/json. Настройте TradingView для отправки JSON с {{strategy.order.alert_message}}")
 
         try:
             data = json.loads(raw_data_str)
@@ -34,10 +89,17 @@ async def webhook(request: Request):
             raise HTTPException(status_code=400, detail="Пустой JSON")
 
         raw_action = data.get('action', '').upper()
-        if raw_action not in ['BUY', 'SELL', 'LONG', 'SHORT']:
-            logger.error(f"Некорректное действие: {raw_action}")
-            raise HTTPException(status_code=400, detail="Действие должно быть BUY, SELL, LONG или SHORT")
 
+        # Добавляем обработку MOVE_SL
+        if raw_action not in ['BUY', 'SELL', 'LONG', 'SHORT', 'MOVE_SL']:
+            logger.error(f"Некорректное действие: {raw_action}")
+            raise HTTPException(status_code=400, detail="Действие должно быть BUY, SELL, LONG, SHORT или MOVE_SL")
+
+        # Обработка MOVE_SL
+        if raw_action == 'MOVE_SL':
+            return await handle_move_sl_signal(data)
+
+        # Остальная логика для BUY/SELL
         action = raw_action if raw_action in ['BUY', 'SELL'] else ('BUY' if raw_action == 'LONG' else 'SELL')
 
         symbol = data.get('symbol')

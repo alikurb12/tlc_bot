@@ -5,6 +5,8 @@ from hashlib import sha256
 import json
 import logging
 
+from database import get_cursor, commit
+
 logger = logging.getLogger(__name__)
 
 APIURL = "https://open-api.bingx.com"
@@ -312,3 +314,85 @@ def parseParam(paramsMap: dict) -> str:
     paramsStr = "&".join(["%s=%s" % (x, paramsMap[x]) for x in sortedKeys])
     timestamp = int(time.time() * 1000) + TIME_OFFSET
     return paramsStr + "&timestamp=" + str(timestamp) if paramsStr else "timestamp=" + str(timestamp)
+
+
+def move_sl_to_breakeven(symbol: str, api_key: str, secret_key: str) -> bool:
+    """
+    Перемещает стоп-лосс к цене входа для открытой позиции
+    """
+    try:
+        # Получаем открытые позиции
+        open_positions = get_open_positions(symbol, api_key, secret_key)
+
+        for position in open_positions:
+            position_side = position.get("positionSide")
+            position_amt = float(position.get("positionAmt", 0))
+            avg_price = float(position.get("avgPrice", 0))
+
+            if position_amt != 0 and avg_price > 0:
+                # Получаем открытые ордера стоп-лосса
+                open_orders = get_open_orders(symbol, api_key, secret_key)
+                sl_orders = [order for order in open_orders.get("data", {}).get("orders", [])
+                             if order.get("type") == "STOP_MARKET"
+                             and order.get("positionSide") == position_side]
+
+                # Отменяем старые SL ордера
+                for sl_order in sl_orders:
+                    order_id = sl_order.get("orderId")
+                    if order_id:
+                        cancel_order(symbol, order_id, api_key, secret_key)
+                        logger.info(f"Старый SL ордер {order_id} отменен")
+
+                # Создаем новый SL ордер по цене входа
+                quantity = abs(position_amt)
+                new_sl_price = avg_price  # Перемещаем SL к цене входа
+
+                # Для LONG позиции SL должен быть ниже цены входа, для SHORT - выше
+                if position_side == "LONG":
+                    # Для LONG устанавливаем SL чуть ниже цены входа (например, на 0.1%)
+                    new_sl_price = avg_price * 0.999
+                else:  # SHORT
+                    # Для SHORT устанавливаем SL чуть выше цены входа (например, на 0.1%)
+                    new_sl_price = avg_price * 1.001
+
+                # Создаем новый SL ордер
+                sl_order_params = {
+                    "symbol": symbol,
+                    "side": "SELL" if position_side == "LONG" else "BUY",
+                    "positionSide": position_side,
+                    "type": "STOP_MARKET",
+                    "quantity": round(quantity, 3),
+                    "stopPrice": round(new_sl_price, 4)
+                }
+
+                paramsStr = parseParam(sl_order_params)
+                response = send_request("POST", '/openApi/swap/v2/trade/order', paramsStr, {}, api_key, secret_key)
+                response_data = json.loads(response)
+
+                if response_data.get("code") == 0:
+                    new_sl_order_id = response_data["data"]["order"]["orderId"]
+                    logger.info(f"Новый SL ордер {new_sl_order_id} создан по цене {new_sl_price}")
+
+                    # Обновляем базу данных
+                    cursor = get_cursor()
+                    cursor.execute(
+                        """
+                        UPDATE trades 
+                        SET stop_loss = %s, sl_order_id = %s 
+                        WHERE user_id = (SELECT user_id FROM users WHERE api_key = %s) 
+                        AND symbol = %s AND status = 'open'
+                        """,
+                        (new_sl_price, new_sl_order_id, api_key, symbol)
+                    )
+                    commit()
+
+                    return True
+                else:
+                    raise ValueError(f"Ошибка создания нового SL ордера: {response_data.get('msg')}")
+
+        logger.info(f"Нет открытых позиций для {symbol} или позиция уже закрыта")
+        return True
+
+    except Exception as e:
+        logger.error(f"Ошибка при перемещении SL для {symbol}: {str(e)}")
+        raise

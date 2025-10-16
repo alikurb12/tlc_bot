@@ -458,3 +458,74 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
         return None
+
+
+def process_bingx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
+    """Обработка MOVE_SL для BingX"""
+    user_id = user['user_id']
+    api_key = user['api_key']
+    secret_key = user['secret_key']
+
+    try:
+        from bingx_api import move_sl_to_breakeven
+
+        success = move_sl_to_breakeven(symbol, api_key, secret_key)
+
+        if success:
+            # Отправляем уведомление
+            notification = {
+                "action": "MOVE_SL",
+                "symbol": symbol,
+                "message": f"Стоп-лосс перемещен к цене входа для {symbol}"
+            }
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                send_signal_notification(notification, user_id), loop
+            )
+
+            return {
+                "user_id": user_id,
+                "exchange": "bingx",
+                "status": "success",
+                "message": f"SL перемещен к цене входа для {symbol}"
+            }
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки MOVE_SL для пользователя {user_id}: {str(e)}")
+        return None
+
+
+def process_okx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
+    """Обработка MOVE_SL для OKX"""
+    user_id = user['user_id']
+    api_key = user['api_key']
+    secret_key = user['secret_key']
+    passphrase = user['passphrase']
+
+    try:
+        from okx_api import move_sl_to_breakeven
+
+        success = move_sl_to_breakeven(symbol, api_key, secret_key, passphrase)
+
+        if success:
+            # Отправляем уведомление
+            notification = {
+                "action": "MOVE_SL",
+                "symbol": symbol,
+                "message": f"Стоп-лосс перемещен к цене входа для {symbol}"
+            }
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                send_signal_notification(notification, user_id), loop
+            )
+
+            return {
+                "user_id": user_id,
+                "exchange": "okx",
+                "status": "success",
+                "message": f"SL перемещен к цене входа для {symbol}"
+            }
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки MOVE_SL для пользователя {user_id}: {str(e)}")
+        return None
