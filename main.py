@@ -114,8 +114,8 @@ conn.commit()
 
 TARIFFS = {
     'test': {'days': 1, 'price': 1, 'name': 'Тестовый (1 день)'},
-    '1month': {'days': 30, 'price': 30, 'name': '1 месяц'},
-    '3months': {'days': 90, 'price': 70, 'name': '3 месяца'},
+    '1month': {'days': 30, 'price': 6, 'name': '1 месяц'},
+    '3months': {'days': 90, 'price': 15, 'name': '3 месяца'},
 }
 
 class PaymentStates(StatesGroup):
@@ -708,7 +708,7 @@ async def connect_api(message: types.Message, state: FSMContext):
     if result and result['subscription_type'] == "referral_approved" and result['subscription_end'] > datetime.datetime.now():
         if result['api_key']:
             await message.answer(
-                "✅ У вас уже подключен API. Вы можете проверить информацию о подписке или связаться с поддержкой для изменения ключей.",
+                "✅ У вас уже подключенна автоматизация. Вы можете проверить информацию о подписке или связаться с поддержкой для изменения ключей.",
                 reply_markup=get_main_menu(user_id)
             )
             await state.clear()
@@ -731,7 +731,7 @@ async def connect_api(message: types.Message, state: FSMContext):
         await state.set_state(PaymentStates.waiting_for_api_key)
     else:
         await message.answer(
-            "❗️ У вас нет активной подписки для подключения API. Пожалуйста, выберите тип подписки:",
+            "❗️ У вас нет активной подписки для подключения автоматизации. Пожалуйста, выберите тип подписки:",
             reply_markup=get_subscription_type_keyboard()
         )
         await state.set_state(PaymentStates.waiting_for_subscription_type)
@@ -872,7 +872,7 @@ async def process_passphrase(message: types.Message, state: FSMContext):
     conn.commit()
 
     await message.answer(
-        "✅ API-ключ и Passphrase успешно добавлены!",
+        "✅ API-ключ и Passphrase успешно добавлены! Автоматизация подключена.",
         reply_markup=get_main_menu(user_id)
     )
     await state.clear()
