@@ -5,12 +5,11 @@ from hashlib import sha256
 import json
 import logging
 
-from database import get_cursor, commit
-
 logger = logging.getLogger(__name__)
 
 APIURL = "https://open-api.bingx.com"
 TIME_OFFSET = 0
+
 
 def get_server_time() -> int:
     try:
@@ -21,7 +20,8 @@ def get_server_time() -> int:
             server_time = int(data['data']['serverTime'])
             local_time = int(time.time() * 1000)
             offset = server_time - local_time
-            logger.info(f"Синхронизация времени: server_time={server_time}, local_time={local_time}, offset={offset} ms")
+            logger.info(
+                f"Синхронизация времени: server_time={server_time}, local_time={local_time}, offset={offset} ms")
             return offset
         else:
             raise ValueError(f"Ошибка получения времени сервера: {data.get('msg')}")
@@ -29,12 +29,14 @@ def get_server_time() -> int:
         logger.error(f"Ошибка при получении времени сервера: {str(e)}")
         return 0
 
+
 def get_balance(api_key: str, secret_key: str) -> str:
     path = '/openApi/swap/v2/user/balance'
     method = "GET"
     paramsMap = {}
     paramsStr = parseParam(paramsMap)
     return send_request(method, path, paramsStr, {}, api_key, secret_key)
+
 
 def get_current_price(symbol: str) -> float:
     try:
@@ -50,6 +52,7 @@ def get_current_price(symbol: str) -> float:
     except Exception as e:
         logger.error(f"Ошибка при получении цены: {e}")
         raise
+
 
 def get_symbol_info(symbol: str) -> dict:
     try:
@@ -68,7 +71,9 @@ def get_symbol_info(symbol: str) -> dict:
         logger.error(f"Ошибка при получении информации о паре: {symbol}")
         raise
 
-def set_leverage(symbol: str, leverage: int=5, position_side: str="LONG", api_key: str=None, secret_key: str=None) -> bool:
+
+def set_leverage(symbol: str, leverage: int = 5, position_side: str = "LONG", api_key: str = None,
+                 secret_key: str = None) -> bool:
     try:
         path = '/openApi/swap/v2/trade/leverage'
         method = "POST"
@@ -87,6 +92,7 @@ def set_leverage(symbol: str, leverage: int=5, position_side: str="LONG", api_ke
     except Exception as e:
         logger.error(f"Ошибка при установке плеча для {symbol} side={position_side}: {str(e)}")
         raise
+
 
 def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.05, api_key: str = None,
                        secret_key: str = None) -> float:
@@ -121,6 +127,7 @@ def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.0
         logger.error(f"Ошибка при расчете количества: {str(e)}")
         raise
 
+
 def create_main_order(symbol: str, side: str, quantity: float, api_key: str, secret_key: str) -> str:
     path = '/openApi/swap/v2/trade/order'
     method = "POST"
@@ -134,9 +141,47 @@ def create_main_order(symbol: str, side: str, quantity: float, api_key: str, sec
     paramsStr = parseParam(paramsMap)
     return send_request(method, path, paramsStr, {}, api_key, secret_key)
 
+
+def calculate_tp_quantities(total_quantity: float, symbol: str) -> list:
+    """
+    Рассчитывает количества для TP ордеров с учетом минимальных лимитов
+    """
+    symbol_info = get_symbol_info(symbol)
+    min_qty = float(symbol_info["minQty"])
+    step_size = float(symbol_info["stepSize"])
+
+    # Для 3 TP ордеров распределяем: 33%, 33%, 34%
+    tp_count = 3
+    base_part = total_quantity / tp_count
+
+    # Округляем до step_size
+    part1 = round(base_part * 0.33 / step_size) * step_size
+    part2 = round(base_part * 0.33 / step_size) * step_size
+    part3 = total_quantity - part1 - part2
+
+    # Проверяем минимальные количества
+    quantities = []
+    for qty in [part1, part2, part3]:
+        if qty >= min_qty:
+            quantities.append(round(qty, 6))  # Округляем до 6 знаков
+        else:
+            quantities.append(min_qty)
+
+    # Если сумма не совпадает, корректируем последний TP
+    total_tp = sum(quantities)
+    if abs(total_tp - total_quantity) > 0.000001:
+        quantities[-1] = total_quantity - sum(quantities[:-1])
+        quantities[-1] = max(min_qty, quantities[-1])
+
+    logger.info(f"Распределение TP: {quantities}, сумма: {sum(quantities)}, исходное: {total_quantity}")
+    return quantities
+
+
 def create_tp_sl_orders(symbol: str, side: str, quantity: float, stop_loss: float, take_profits: list, api_key: str,
                         secret_key: str):
     orders = []
+
+    # SL ордер на всю позицию
     stop_order = {
         "symbol": symbol,
         "side": "SELL" if side == "BUY" else "BUY",
@@ -148,28 +193,57 @@ def create_tp_sl_orders(symbol: str, side: str, quantity: float, stop_loss: floa
     orders.append(stop_order)
 
     current_price = get_current_price(symbol)
-    sorted_take_profits = sorted(take_profits) if side == "BUY" else sorted(take_profits, reverse=True)
 
-    for tp_price in sorted_take_profits:
-        if tp_price is not None:
-            if side == "BUY" and tp_price <= current_price:
-                logger.warning(f"Пропущен TP ордер для {symbol}: TP цена {tp_price} ниже текущей цены {current_price}")
-                continue
-            if side == "SELL" and tp_price >= current_price:
-                logger.warning(f"Пропущен TP ордер для {symbol}: TP цена {tp_price} выше текущей цены {current_price}")
-                continue
-            tp_order = {
-                "symbol": symbol,
-                "side": "SELL" if side == "BUY" else "BUY",
-                "positionSide": "LONG" if side == "BUY" else "SHORT",
-                "type": "TAKE_PROFIT_MARKET",
-                "quantity": round(quantity, 3),
-                "stopPrice": tp_price
-            }
-            orders.append(tp_order)
+    # Фильтруем None значения и сортируем TP
+    valid_take_profits = [tp for tp in take_profits if tp is not None]
+    sorted_take_profits = sorted(valid_take_profits) if side == "BUY" else sorted(valid_take_profits, reverse=True)
+
+    # Рассчитываем количества для TP
+    tp_quantities = []
+    if len(sorted_take_profits) > 0:
+        tp_quantities = calculate_tp_quantities(quantity, symbol)
+
+        # Если TP меньше чем 3, корректируем количества
+        if len(sorted_take_profits) < 3:
+            tp_quantities = tp_quantities[:len(sorted_take_profits)]
+            # Перераспределяем количество
+            total_tp_qty = sum(tp_quantities)
+            if total_tp_qty > 0:
+                scale_factor = quantity / total_tp_qty
+                tp_quantities = [round(qty * scale_factor, 6) for qty in tp_quantities]
+
+    for i, tp_price in enumerate(sorted_take_profits):
+        if side == "BUY" and tp_price <= current_price:
+            logger.warning(f"Пропущен TP ордер для {symbol}: TP цена {tp_price} ниже текущей цены {current_price}")
+            continue
+        if side == "SELL" and tp_price >= current_price:
+            logger.warning(f"Пропущен TP ордер для {symbol}: TP цена {tp_price} выше текущей цены {current_price}")
+            continue
+
+        # Используем соответствующее количество для этого TP
+        tp_qty = tp_quantities[i] if i < len(tp_quantities) else round(quantity / len(sorted_take_profits), 6)
+
+        # Проверяем минимальное количество
+        symbol_info = get_symbol_info(symbol)
+        min_qty = float(symbol_info["minQty"])
+        if tp_qty < min_qty:
+            logger.warning(f"Количество TP {tp_qty} меньше минимального {min_qty}, используем минимальное")
+            tp_qty = min_qty
+
+        tp_order = {
+            "symbol": symbol,
+            "side": "SELL" if side == "BUY" else "BUY",
+            "positionSide": "LONG" if side == "BUY" else "SHORT",
+            "type": "TAKE_PROFIT_MARKET",
+            "quantity": round(tp_qty, 3),
+            "stopPrice": tp_price
+        }
+        orders.append(tp_order)
 
     results = []
     order_ids = []
+
+    # Создаем все ордера с задержками
     for order in orders:
         time.sleep(0.5)
         paramsStr = parseParam(order)
@@ -178,12 +252,14 @@ def create_tp_sl_orders(symbol: str, side: str, quantity: float, stop_loss: floa
         if response_data.get("code") == 0:
             order_id = response_data["data"]["order"]["orderId"]
             order_ids.append(order_id)
+            order_type = "SL" if order.get("type") == "STOP_MARKET" else "TP"
+            logger.info(f"{order_type} ордер создан: {order_id}, количество: {order['quantity']}")
         else:
-            logger.error(f"Ошибка создания TP/SL ордера: {response_data.get('msg')}")
+            logger.error(f"Ошибка создания ордера: {response_data.get('msg')}")
         results.append(response)
-        logger.info(f"TP/SL ордер response: {response}")
 
     return results, sorted_take_profits, order_ids
+
 
 def get_open_orders(symbol: str, api_key: str, secret_key: str) -> dict:
     try:
@@ -197,6 +273,7 @@ def get_open_orders(symbol: str, api_key: str, secret_key: str) -> dict:
     except Exception as e:
         logger.error(f"Ошибка при получении открытых ордеров: {str(e)}")
         raise
+
 
 def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str) -> bool:
     try:
@@ -257,6 +334,7 @@ def close_position(symbol: str, position_side: str, api_key: str, secret_key: st
         logger.error(f"Ошибка при закрытии позиции {position_side} для {symbol}: {str(e)}")
         raise
 
+
 def get_open_positions(symbol: str, api_key: str, secret_key: str) -> list:
     try:
         path = '/openApi/swap/v2/user/positions'
@@ -272,48 +350,6 @@ def get_open_positions(symbol: str, api_key: str, secret_key: str) -> list:
     except Exception as e:
         logger.error(f"Ошибка при получении открытых позиций для {symbol}: {str(e)}")
         raise
-
-def get_sign(api_secret: str, payload: str) -> str:
-    signature = hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), digestmod=sha256).hexdigest()
-    logger.info("sign=%s", signature)
-    return signature
-
-def send_request(method: str, path: str, urlpa: str, payload: dict, api_key: str, secret_key: str, retries: int = 3) -> str:
-    global TIME_OFFSET
-    attempt = 0
-    while attempt < retries:
-        try:
-            url = f"{APIURL}{path}?{urlpa}&signature={get_sign(secret_key, urlpa)}"
-            logger.info("Request URL: %s", url)
-            headers = {'X-BX-APIKEY': api_key}
-            response = requests.request(method, url, headers=headers, data=payload)
-            response_data = response.json()
-            if response_data.get("code") in [109414, 109500] and "timestamp is invalid" in response_data.get("msg", "").lower():
-                logger.warning(f"Недопустимый timestamp, попытка {attempt + 1}/{retries}. Повторная синхронизация времени...")
-                TIME_OFFSET = get_server_time()
-                urlpa = urlpa.split("&timestamp=")[0] + "&timestamp=" + str(int(time.time() * 1000) + TIME_OFFSET)
-                attempt += 1
-                time.sleep(1)
-                continue
-            return response.text
-        except Exception as e:
-            logger.error(f"Ошибка запроса (попытка {attempt + 1}/{retries}): {str(e)}")
-            if attempt < retries - 1:
-                TIME_OFFSET = get_server_time()
-                urlpa = urlpa.split("&timestamp=")[0] + "&timestamp=" + str(int(time.time() * 1000) + TIME_OFFSET)
-                time.sleep(1)
-            attempt += 1
-    raise ValueError(f"Не удалось выполнить запрос после {retries} попыток")
-
-def parseParam(paramsMap: dict) -> str:
-    global TIME_OFFSET
-    if not hasattr(parseParam, 'TIME_OFFSET'):
-        parseParam.TIME_OFFSET = get_server_time()
-        TIME_OFFSET = parseParam.TIME_OFFSET
-    sortedKeys = sorted(paramsMap)
-    paramsStr = "&".join(["%s=%s" % (x, paramsMap[x]) for x in sortedKeys])
-    timestamp = int(time.time() * 1000) + TIME_OFFSET
-    return paramsStr + "&timestamp=" + str(timestamp) if paramsStr else "timestamp=" + str(timestamp)
 
 
 def move_sl_to_breakeven(symbol: str, api_key: str, secret_key: str) -> bool:
@@ -374,6 +410,7 @@ def move_sl_to_breakeven(symbol: str, api_key: str, secret_key: str) -> bool:
                     logger.info(f"Новый SL ордер {new_sl_order_id} создан по цене {new_sl_price}")
 
                     # Обновляем базу данных
+                    from database import get_cursor, commit
                     cursor = get_cursor()
                     cursor.execute(
                         """
@@ -396,3 +433,51 @@ def move_sl_to_breakeven(symbol: str, api_key: str, secret_key: str) -> bool:
     except Exception as e:
         logger.error(f"Ошибка при перемещении SL для {symbol}: {str(e)}")
         raise
+
+
+def get_sign(api_secret: str, payload: str) -> str:
+    signature = hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), digestmod=sha256).hexdigest()
+    logger.info("sign=%s", signature)
+    return signature
+
+
+def send_request(method: str, path: str, urlpa: str, payload: dict, api_key: str, secret_key: str,
+                 retries: int = 3) -> str:
+    global TIME_OFFSET
+    attempt = 0
+    while attempt < retries:
+        try:
+            url = f"{APIURL}{path}?{urlpa}&signature={get_sign(secret_key, urlpa)}"
+            logger.info("Request URL: %s", url)
+            headers = {'X-BX-APIKEY': api_key}
+            response = requests.request(method, url, headers=headers, data=payload)
+            response_data = response.json()
+            if response_data.get("code") in [109414, 109500] and "timestamp is invalid" in response_data.get("msg",
+                                                                                                             "").lower():
+                logger.warning(
+                    f"Недопустимый timestamp, попытка {attempt + 1}/{retries}. Повторная синхронизация времени...")
+                TIME_OFFSET = get_server_time()
+                urlpa = urlpa.split("&timestamp=")[0] + "&timestamp=" + str(int(time.time() * 1000) + TIME_OFFSET)
+                attempt += 1
+                time.sleep(1)
+                continue
+            return response.text
+        except Exception as e:
+            logger.error(f"Ошибка запроса (попытка {attempt + 1}/{retries}): {str(e)}")
+            if attempt < retries - 1:
+                TIME_OFFSET = get_server_time()
+                urlpa = urlpa.split("&timestamp=")[0] + "&timestamp=" + str(int(time.time() * 1000) + TIME_OFFSET)
+                time.sleep(1)
+            attempt += 1
+    raise ValueError(f"Не удалось выполнить запрос после {retries} попыток")
+
+
+def parseParam(paramsMap: dict) -> str:
+    global TIME_OFFSET
+    if not hasattr(parseParam, 'TIME_OFFSET'):
+        parseParam.TIME_OFFSET = get_server_time()
+        TIME_OFFSET = parseParam.TIME_OFFSET
+    sortedKeys = sorted(paramsMap)
+    paramsStr = "&".join(["%s=%s" % (x, paramsMap[x]) for x in sortedKeys])
+    timestamp = int(time.time() * 1000) + TIME_OFFSET
+    return paramsStr + "&timestamp=" + str(timestamp) if paramsStr else "timestamp=" + str(timestamp)
