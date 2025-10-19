@@ -1,15 +1,27 @@
 import json
+import math
 from fastapi import APIRouter, Request, HTTPException
 import logging
 from datetime import datetime
 from database import get_cursor
 from models import Signal
 from utils import normalize_symbol
-from services import process_bingx_signal, process_okx_signal, process_bingx_move_sl, process_okx_move_sl
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def clean_json_data(data_str: str) -> dict:
+    """Очищает JSON данные от NaN и других невалидных значений"""
+    try:
+        # Заменяем NaN на null (None в Python)
+        cleaned_str = data_str.replace(': NaN', ': null').replace(':NaN', ':null')
+        # Парсим JSON
+        return json.loads(cleaned_str)
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка парсинга JSON после очистки: {str(e)}")
+        raise
 
 
 async def handle_move_sl_signal(data: dict):
@@ -37,9 +49,12 @@ async def handle_move_sl_signal(data: dict):
         normalized_symbol = normalize_symbol(symbol, exchange)
 
         try:
+            # Импортируем здесь чтобы избежать циклического импорта
             if exchange == 'bingx':
+                from services import process_bingx_move_sl
                 result = process_bingx_move_sl(user, normalized_symbol)
             elif exchange == 'okx':
+                from services import process_okx_move_sl
                 result = process_okx_move_sl(user, normalized_symbol)
             else:
                 logger.error(f"Неизвестная биржа: {exchange} для пользователя {user_id}")
@@ -72,14 +87,15 @@ async def webhook(request: Request):
         logger.info(f"Получен запрос: {raw_data_str}")
 
         content_type = request.headers.get('Content-Type', '').lower()
-        if not content_type or 'application/json' not in content_type:
-            logger.error(
-                f"Неверный Content-Type: {content_type}. Ожидается application/json от TradingView с {{strategy.order.alert_message}}")
-            raise HTTPException(status_code=400,
-                                detail="Ожидается Content-Type: application/json. Настройте TradingView для отправки JSON с {{strategy.order.alert_message}}")
+
+        # Принимаем как text/plain так и application/json
+        if not content_type or ('application/json' not in content_type and 'text/plain' not in content_type):
+            logger.error(f"Неверный Content-Type: {content_type}. Ожидается application/json или text/plain")
+            raise HTTPException(status_code=400, detail="Ожидается Content-Type: application/json или text/plain")
 
         try:
-            data = json.loads(raw_data_str)
+            # Очищаем данные от NaN и парсим JSON
+            data = clean_json_data(raw_data_str)
         except Exception as e:
             logger.error(f"Ошибка парсинга JSON: {str(e)}, тело запроса: {raw_data_str}")
             raise HTTPException(status_code=400, detail=f"Неверный формат JSON: {str(e)}")
@@ -115,13 +131,38 @@ async def webhook(request: Request):
             logger.error(f"Ошибка в цене: {str(e)}")
             raise HTTPException(status_code=400, detail="Неверный формат цены")
 
-        stop_loss = float(data.get('stop_loss')) if data.get('stop_loss') else None
-        take_profit_1 = float(data.get('take_profit_1')) if data.get('take_profit_1') else None
-        take_profit_2 = float(data.get('take_profit_2')) if data.get('take_profit_2') else None
-        take_profit_3 = float(data.get('take_profit_3')) if data.get('take_profit_3') else None
+        stop_loss = data.get('stop_loss')
+        take_profit_1 = data.get('take_profit_1')
+        take_profit_2 = data.get('take_profit_2')
+        take_profit_3 = data.get('take_profit_3')
+
+        # Обрабатываем возможные NaN значения
+        try:
+            stop_loss = float(stop_loss) if stop_loss is not None and not math.isnan(float(stop_loss)) else None
+        except (TypeError, ValueError):
+            stop_loss = None
+
+        try:
+            take_profit_1 = float(take_profit_1) if take_profit_1 is not None and not math.isnan(
+                float(take_profit_1)) else None
+        except (TypeError, ValueError):
+            take_profit_1 = None
+
+        try:
+            take_profit_2 = float(take_profit_2) if take_profit_2 is not None and not math.isnan(
+                float(take_profit_2)) else None
+        except (TypeError, ValueError):
+            take_profit_2 = None
+
+        try:
+            take_profit_3 = float(take_profit_3) if take_profit_3 is not None and not math.isnan(
+                float(take_profit_3)) else None
+        except (TypeError, ValueError):
+            take_profit_3 = None
 
         if not stop_loss or not all([take_profit_1, take_profit_2, take_profit_3]):
             logger.error("Не указаны все необходимые параметры SL и TP")
+            logger.error(f"SL: {stop_loss}, TP1: {take_profit_1}, TP2: {take_profit_2}, TP3: {take_profit_3}")
             raise HTTPException(status_code=400, detail="Необходимо указать stop_loss и все три take_profit")
 
         # Signal model validation
@@ -163,9 +204,12 @@ async def webhook(request: Request):
             }
 
             try:
+                # Импортируем здесь чтобы избежать циклического импорта
                 if exchange == 'bingx':
+                    from services import process_bingx_signal
                     result = process_bingx_signal(user, signal)
                 elif exchange == 'okx':
+                    from services import process_okx_signal
                     result = process_okx_signal(user, signal)
                 else:
                     logger.error(f"Неизвестная биржа: {exchange} для пользователя {user_id}")
