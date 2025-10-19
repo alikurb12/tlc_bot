@@ -94,39 +94,61 @@ def set_leverage(symbol: str, leverage: int = 5, position_side: str = "LONG", ap
         raise
 
 
-def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.05, api_key: str = None,
-                       secret_key: str = None) -> float:
-    try:
-        balance_response = get_balance(api_key, secret_key)
-        balance_data = json.loads(balance_response)
-        usdt_balance = float(balance_data["data"]["balance"]["availableMargin"])
+def calculate_tp_quantities(total_quantity: float, symbol: str) -> list:
+    """
+    Рассчитывает количества для TP ордеров с учетом минимальных лимитов
+    """
+    symbol_info = get_symbol_info(symbol)
+    min_qty = float(symbol_info["minQty"])
+    step_size = float(symbol_info["stepSize"])
 
-        if usdt_balance <= 0:
-            raise ValueError("Недостаточно USDT на балансе!")
+    # Проверяем, достаточно ли общего количества для 3 TP
+    if total_quantity < min_qty * 3:
+        # Если недостаточно, используем только один TP на всю позицию
+        logger.warning(f"Общее количество {total_quantity} слишком мало для 3 TP, используем 1 TP")
+        return [total_quantity]
 
-        current_price = get_current_price(symbol)
-        symbol_info = get_symbol_info(symbol)
+    # Для 3 TP ордеров распределяем равномерно
+    tp_count = 3
+    base_part = total_quantity / tp_count
 
-        min_qty = float(symbol_info["minQty"])
-        step_size = float(symbol_info["stepSize"])
+    # Округляем базовую часть до step_size
+    base_part_rounded = round(base_part / step_size) * step_size
 
-        risk_amount = usdt_balance * risk_percent
-        total_trade_amount = risk_amount * leverage
-        quantity = total_trade_amount / current_price
+    # Создаем первые две части
+    part1 = base_part_rounded
+    part2 = base_part_rounded
+    part3 = total_quantity - part1 - part2
 
-        required_margin = total_trade_amount / leverage * 1.001
-        if required_margin > usdt_balance:
-            raise ValueError(
-                f"Недостаточно маржи: требуется {required_margin:.4f} USDT, доступно {usdt_balance:.4f} USDT")
+    # Проверяем, что третья часть не меньше минимального количества
+    if part3 < min_qty:
+        # Уменьшаем первые две части чтобы увеличить третью
+        part1 = round((total_quantity - min_qty) / 2 / step_size) * step_size
+        part2 = part1
+        part3 = total_quantity - part1 - part2
 
-        quantity = round(quantity / step_size) * step_size
-        quantity = max(min_qty, quantity)
+    quantities = [part1, part2, part3]
 
-        return quantity
-    except Exception as e:
-        logger.error(f"Ошибка при расчете количества: {str(e)}")
-        raise
+    # Проверяем все части на минимальное количество
+    for i in range(len(quantities)):
+        if quantities[i] < min_qty:
+            quantities[i] = min_qty
 
+    # Корректируем сумму
+    total_tp = sum(quantities)
+    if abs(total_tp - total_quantity) > 0.000001:
+        # Корректируем последнюю часть
+        quantities[-1] = total_quantity - sum(quantities[:-1])
+        quantities[-1] = max(min_qty, quantities[-1])
+        quantities[-1] = round(quantities[-1] / step_size) * step_size
+
+    # Вычисляем проценты
+    percentages = [round(q / total_quantity * 100, 2) for q in quantities]
+
+    logger.info(f"Распределение TP: {quantities}, сумма: {sum(quantities)}, исходное: {total_quantity}")
+    logger.info(f"Проценты: {percentages}%")
+
+    return quantities
 
 def create_main_order(symbol: str, side: str, quantity: float, api_key: str, secret_key: str) -> str:
     path = '/openApi/swap/v2/trade/order'
