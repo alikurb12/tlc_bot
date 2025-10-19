@@ -94,6 +94,54 @@ def set_leverage(symbol: str, leverage: int = 5, position_side: str = "LONG", ap
         raise
 
 
+def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.05, api_key: str = None,
+                       secret_key: str = None) -> float:
+    try:
+        balance_response = get_balance(api_key, secret_key)
+        balance_data = json.loads(balance_response)
+        usdt_balance = float(balance_data["data"]["balance"]["availableMargin"])
+
+        if usdt_balance <= 0:
+            raise ValueError("Недостаточно USDT на балансе!")
+
+        current_price = get_current_price(symbol)
+        symbol_info = get_symbol_info(symbol)
+
+        min_qty = float(symbol_info["minQty"])
+        step_size = float(symbol_info["stepSize"])
+
+        risk_amount = usdt_balance * risk_percent
+        total_trade_amount = risk_amount * leverage
+        quantity = total_trade_amount / current_price
+
+        required_margin = total_trade_amount / leverage * 1.001
+        if required_margin > usdt_balance:
+            raise ValueError(
+                f"Недостаточно маржи: требуется {required_margin:.4f} USDT, доступно {usdt_balance:.4f} USDT")
+
+        quantity = round(quantity / step_size) * step_size
+        quantity = max(min_qty, quantity)
+
+        return quantity
+    except Exception as e:
+        logger.error(f"Ошибка при расчете количества: {str(e)}")
+        raise
+
+
+def create_main_order(symbol: str, side: str, quantity: float, api_key: str, secret_key: str) -> str:
+    path = '/openApi/swap/v2/trade/order'
+    method = "POST"
+    paramsMap = {
+        "symbol": symbol,
+        "side": side,
+        "positionSide": "LONG" if side == "BUY" else "SHORT",
+        "type": "MARKET",
+        "quantity": quantity
+    }
+    paramsStr = parseParam(paramsMap)
+    return send_request(method, path, paramsStr, {}, api_key, secret_key)
+
+
 def calculate_tp_quantities(total_quantity: float, symbol: str) -> list:
     """
     Рассчитывает количества для TP ордеров с учетом минимальных лимитов
@@ -148,54 +196,6 @@ def calculate_tp_quantities(total_quantity: float, symbol: str) -> list:
     logger.info(f"Распределение TP: {quantities}, сумма: {sum(quantities)}, исходное: {total_quantity}")
     logger.info(f"Проценты: {percentages}%")
 
-    return quantities
-
-def create_main_order(symbol: str, side: str, quantity: float, api_key: str, secret_key: str) -> str:
-    path = '/openApi/swap/v2/trade/order'
-    method = "POST"
-    paramsMap = {
-        "symbol": symbol,
-        "side": side,
-        "positionSide": "LONG" if side == "BUY" else "SHORT",
-        "type": "MARKET",
-        "quantity": quantity
-    }
-    paramsStr = parseParam(paramsMap)
-    return send_request(method, path, paramsStr, {}, api_key, secret_key)
-
-
-def calculate_tp_quantities(total_quantity: float, symbol: str) -> list:
-    """
-    Рассчитывает количества для TP ордеров с учетом минимальных лимитов
-    """
-    symbol_info = get_symbol_info(symbol)
-    min_qty = float(symbol_info["minQty"])
-    step_size = float(symbol_info["stepSize"])
-
-    # Для 3 TP ордеров распределяем: 33%, 33%, 34%
-    tp_count = 3
-    base_part = total_quantity / tp_count
-
-    # Округляем до step_size
-    part1 = round(base_part * 0.33 / step_size) * step_size
-    part2 = round(base_part * 0.33 / step_size) * step_size
-    part3 = total_quantity - part1 - part2
-
-    # Проверяем минимальные количества
-    quantities = []
-    for qty in [part1, part2, part3]:
-        if qty >= min_qty:
-            quantities.append(round(qty, 6))  # Округляем до 6 знаков
-        else:
-            quantities.append(min_qty)
-
-    # Если сумма не совпадает, корректируем последний TP
-    total_tp = sum(quantities)
-    if abs(total_tp - total_quantity) > 0.000001:
-        quantities[-1] = total_quantity - sum(quantities[:-1])
-        quantities[-1] = max(min_qty, quantities[-1])
-
-    logger.info(f"Распределение TP: {quantities}, сумма: {sum(quantities)}, исходное: {total_quantity}")
     return quantities
 
 
