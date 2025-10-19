@@ -224,61 +224,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
     cursor.execute("SELECT subscription_end, subscription_type FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
 
-    welcome_text = (
-        "👋 Добро пожаловать в торгового бота VEXTR!\n\n"
-        "Этот бот помогает автоматизировать ваши торговые стратегии на BingX или OKX.\n"
-        "⚠️ Торговля криптовалютой связана с рисками.\n\n"
-        "📄 Перед использованием ознакомьтесь с условиями:\n"
-        "👉 https://telegra.ph/POLZOVATELSKOE-SOGLASHENIE-PUBLICHNAYA-OFERTA-10-05\n\n"
-        "Продолжая, вы подтверждаете согласие с Пользовательским соглашением."
+    # Пропускаем этап соглашения и сразу переходим к выбору типа подписки
+    await message.answer(
+        "Данный бот предоставляет вам возможность пользоваться автоматизированной версией нашей торговой стратегии без надобности выходить за пределы Telegram.\n"
+        "Вам остается лишь один раз провести небольшую настройку, после чего вы сможете пользоваться стратегией и с помощью этого бота.\n"
+        "Для начала вам нужно выбрать тип вашей подписки",
+        reply_markup=get_subscription_type_keyboard()
     )
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="✅ Согласиться", callback_data="agree")],
-        [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-    ])
-    await message.answer(welcome_text, reply_markup=keyboard, parse_mode="HTML")
-    await state.set_state(PaymentStates.waiting_for_agreement)
-
-@router.callback_query(F.data == "agree")
-async def process_agreement(callback_query: types.CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-    await callback_query.answer()
-
-    cursor.execute("SELECT subscription_end, subscription_type FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-
-    if not result:
-        await callback_query.message.edit_text(
-            "Данный бот предоставляет вам возможность пользоваться автоматизированной версией нашей торговой стратегии без надобности выходить за пределы Telegram.\n"
-            "Вам остается лишь один раз провести небольшую настройку, после чего вы сможете пользоваться стратегией и с помощью этого бота.\n"
-            "Для начала вам нужно выбрать тип вашей подписки",
-            reply_markup=get_subscription_type_keyboard()
-        )
-        await state.set_state(PaymentStates.waiting_for_subscription_type)
-    else:
-        subscription_end = result['subscription_end']
-        subscription_type = result['subscription_type']
-        if subscription_type == "referral_approved" and subscription_end is not None and subscription_end > datetime.datetime.now():
-            await callback_query.message.edit_text(
-                f"✅ Ваша подписка активна до <b>{subscription_end.strftime('%Y-%m-%d %H:%M:%S')}</b>",
-                parse_mode="HTML",
-                reply_markup=get_main_menu(user_id)
-            )
-            await state.clear()
-        elif subscription_type == "referral_pending":
-            keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-            ])
-            await callback_query.message.edit_text(
-                "⏳ Ваш UUID на модерации. Пожалуйста, дождитесь подтверждения.",
-                reply_markup=keyboard
-            )
-        else:
-            await callback_query.message.edit_text(
-                "❗️ Ваша подписка истекла или отсутствует. Пожалуйста, выберите тариф:",
-                reply_markup=get_tariffs_keyboard()
-            )
-            await state.set_state(PaymentStates.waiting_for_payment)
+    await state.set_state(PaymentStates.waiting_for_subscription_type)
 
 @router.callback_query(F.data.startswith("subscription:"))
 async def process_subscription_type(callback_query: types.CallbackQuery, state: FSMContext):
@@ -546,6 +499,7 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
 
     cursor.execute("SELECT subscription_type, subscription_end, api_key FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
+
     if result and result['subscription_type'] == "referral_pending":
         keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
             [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
