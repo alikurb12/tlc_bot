@@ -372,7 +372,6 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     price = signal['price']
     stop_loss = signal['stop_loss']
     take_profits = [signal['take_profit_1'], signal['take_profit_2'], signal['take_profit_3']]
-    position_side = "long" if action == "BUY" else "short"
 
     try:
         # Проверяем и закрываем противоположные открытые сделки
@@ -384,7 +383,8 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             logger.error(f"Недостаточный баланс для пользователя {user_id}: {usdt_balance} USDT")
             return None
 
-        okx_set_leverage(symbol, leverage=5, tdMode="isolated", posSide=position_side,
+        # Устанавливаем плечо без posSide
+        okx_set_leverage(symbol, leverage=5, tdMode="isolated",
                          api_key=api_key, secret_key=secret_key, passphrase=passphrase)
 
         quantity = okx_calculate_quantity(symbol, leverage=5, risk_percent=0.05,
@@ -410,11 +410,11 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         cursor = get_cursor()
         cursor.execute(
             """
-            INSERT INTO trades (user_id, exchange, order_id, symbol, side, position_side, quantity, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO trades (user_id, exchange, order_id, symbol, side, quantity, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING trade_id
             """,
-            (user_id, 'okx', order_id, symbol, action, position_side, quantity, price, stop_loss,
+            (user_id, 'okx', order_id, symbol, action, quantity, price, stop_loss,
              take_profits[0], take_profits[1], take_profits[2], sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id,
              'open')
         )
@@ -458,7 +458,6 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
         return None
-
 
 def process_bingx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
     """Обработка MOVE_SL для BingX"""

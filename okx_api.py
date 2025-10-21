@@ -68,25 +68,31 @@ def get_balance(api_key: str, secret_key: str, passphrase: str) -> float:
         raise
 
 
-def set_leverage(symbol: str, leverage: int = 5, tdMode: str = "isolated", posSide: str = "long", api_key: str = None,
+def set_leverage(symbol: str, leverage: int = 5, tdMode: str = "isolated", api_key: str = None,
                  secret_key: str = None, passphrase: str = None) -> bool:
     try:
         account_api = AccountAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
-        response = account_api.set_leverage(
-            lever=str(leverage),
-            mgnMode=tdMode,
-            instId=symbol,
-            posSide=posSide
-        )
+
+        # Параметры для установки плеча без posSide
+        params = {
+            "lever": str(leverage),
+            "mgnMode": tdMode,
+            "instId": symbol
+            # Убираем posSide так как он вызывает ошибку для некоторых инструментов
+        }
+
+        response = account_api.set_leverage(**params)
         logger.info(f"Ответ API установки плеча OKX: {json.dumps(response, indent=2)}")
+
         if response.get("code") != "0":
             raise ValueError(f"Ошибка установки плеча: {response.get('msg')}")
-        logger.info(f"Плечо {leverage}x установлено для {symbol} ({posSide})")
+
+        logger.info(f"Плечо {leverage}x установлено для {symbol} ({tdMode})")
         return True
+
     except Exception as e:
         logger.error(f"Ошибка при установке плеча для {symbol}: {str(e)}")
         raise
-
 
 def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.10, api_key: str = None,
                        secret_key: str = None, passphrase: str = None) -> float:
@@ -127,8 +133,9 @@ def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float,
                       tdMode: str = "isolated", api_key: str = None, secret_key: str = None, passphrase: str = None):
     try:
         trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
-        posSide = "long" if side == "BUY" else "short"
-        sl_side = "sell" if side == "BUY" else "buy"
+
+        # Определяем направление для SL/TP ордеров
+        sl_side = "buy" if side == "SELL" else "sell"
 
         symbol_info = get_symbol_info(symbol, api_key, secret_key, passphrase)
         lot_size = symbol_info["lotSz"]
@@ -138,6 +145,8 @@ def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float,
         logger.info(f"Округленное количество для ордера: {quantity_str} контрактов")
 
         algo_orders = []
+
+        # SL ордер
         algo_orders.append({
             "slTriggerPx": str(round(stop_loss, 4)),
             "slOrdPx": "-1",
@@ -148,6 +157,7 @@ def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float,
             "triggerPxType": "last"
         })
 
+        # Распределение количества для TP ордеров
         total_lots = int(quantity / lot_size)
         tp_lots_base = total_lots // 3
         tp_lots_remainder = total_lots % 3
@@ -164,6 +174,7 @@ def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float,
 
         sorted_take_profits = sorted(take_profits) if side == "BUY" else sorted(take_profits, reverse=True)
 
+        # TP ордера
         for tp_price, tp_qty in zip(sorted_take_profits, tp_quantities):
             if tp_price is not None:
                 algo_orders.append({
@@ -178,28 +189,84 @@ def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float,
 
         logger.info(f"TP размеры: {tp_quantities}, сумма: {total_tp_size}, основной ордер: {quantity_str}")
 
-        response = trade_api.place_order(
-            instId=symbol,
-            tdMode=tdMode,
-            side=side.lower(),
-            posSide=posSide,
-            ordType="market",
-            sz=quantity_str,
-            attachAlgoOrds=algo_orders
-        )
+        # Параметры основного ордера
+        order_params = {
+            "instId": symbol,
+            "tdMode": tdMode,
+            "side": side.lower(),
+            "ordType": "market",
+            "sz": quantity_str,
+            "attachAlgoOrds": algo_orders
+            # Убираем posSide так как он вызывает ошибку для некоторых инструментов
+        }
+
+        logger.info(f"Создание ордера с параметрами: {order_params}")
+
+        response = trade_api.place_order(**order_params)
         logger.info(f"Ответ API создания ордера OKX: {json.dumps(response, indent=2)}")
+
         if response.get("code") != "0":
-            raise ValueError(f"Ошибка создания ордера: {response.get('msg')}")
+            # Если ошибка из-за posSide, пробуем без attachAlgoOrds сначала создать основной ордер
+            if "Parameter posSide error" in response.get("msg", ""):
+                logger.info("Пробуем создать основной ордер без алгоритмических ордеров...")
+
+                # Сначала создаем основной ордер
+                main_order_response = trade_api.place_order(
+                    instId=symbol,
+                    tdMode=tdMode,
+                    side=side.lower(),
+                    ordType="market",
+                    sz=quantity_str
+                )
+
+                if main_order_response.get("code") != "0":
+                    raise ValueError(f"Ошибка создания основного ордера: {main_order_response.get('msg')}")
+
+                order_id = main_order_response["data"][0]["ordId"]
+                logger.info(f"Основной ордер создан: {order_id}")
+
+                # Затем создаем алгоритмические ордера отдельно
+                algo_order_ids = []
+                for algo_order in algo_orders:
+                    time.sleep(0.5)  # Задержка между запросами
+
+                    algo_params = {
+                        "instId": symbol,
+                        "tdMode": tdMode,
+                        "side": algo_order["side"],
+                        "ordType": "conditional",
+                        "sz": algo_order["sz"],
+                        "triggerPxType": algo_order["triggerPxType"]
+                    }
+
+                    # Добавляем параметры в зависимости от типа ордера
+                    if algo_order.get("slTriggerPx"):
+                        algo_params["slTriggerPx"] = algo_order["slTriggerPx"]
+                        algo_params["slOrdPx"] = algo_order["slOrdPx"]
+                    else:
+                        algo_params["tpTriggerPx"] = algo_order["tpTriggerPx"]
+                        algo_params["tpOrdPx"] = algo_order["tpOrdPx"]
+
+                    algo_response = trade_api.place_algo_order(**algo_params)
+                    if algo_response.get("code") == "0":
+                        algo_id = algo_response["data"][0]["algoId"]
+                        algo_order_ids.append(algo_id)
+                        logger.info(f"Алгоритмический ордер создан: {algo_id}")
+                    else:
+                        logger.error(f"Ошибка создания алгоритмического ордера: {algo_response.get('msg')}")
+
+                return main_order_response, sorted_take_profits, order_id, algo_order_ids
+            else:
+                raise ValueError(f"Ошибка создания ордера: {response.get('msg')}")
 
         order_id = response["data"][0]["ordId"]
         algo_order_ids = [order.get("algoId") for order in response["data"] if order.get("algoId")]
 
         return response, sorted_take_profits, order_id, algo_order_ids
+
     except Exception as e:
         logger.error(f"Ошибка при создании основного ордера для {symbol}: {str(e)}")
         raise
-
-# Добавляем в конец okx_api.py
 
 def get_order_status(symbol: str, order_id: str, api_key: str, secret_key: str, passphrase: str) -> dict:
     try:
