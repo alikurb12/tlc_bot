@@ -271,9 +271,9 @@ def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             logger.error(f"Недостаточный баланс для пользователя {user_id}: {usdt_balance} USDT")
             return None
 
-        bingx_set_leverage(symbol, leverage=5, position_side=position_side, api_key=api_key, secret_key=secret_key)
+        bingx_set_leverage(symbol, leverage=10, position_side=position_side, api_key=api_key, secret_key=secret_key)
 
-        quantity = bingx_calculate_quantity(symbol, leverage=5, risk_percent=0.05, api_key=api_key,
+        quantity = bingx_calculate_quantity(symbol, leverage=10, risk_percent=0.05, api_key=api_key,
                                             secret_key=secret_key)
 
         main_order = bingx_create_main_order(symbol, action, quantity, api_key, secret_key)
@@ -384,10 +384,10 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             return None
 
         # Устанавливаем плечо без posSide
-        okx_set_leverage(symbol, leverage=5, tdMode="isolated",
+        okx_set_leverage(symbol, leverage=10, tdMode="isolated",
                          api_key=api_key, secret_key=secret_key, passphrase=passphrase)
 
-        quantity = okx_calculate_quantity(symbol, leverage=5, risk_percent=0.05,
+        quantity = okx_calculate_quantity(symbol, leverage=10, risk_percent=0.05,
                                           api_key=api_key, secret_key=secret_key, passphrase=passphrase)
 
         main_order_response, sorted_take_profits, order_id, algo_order_ids = okx_create_main_order(
