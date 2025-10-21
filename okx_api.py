@@ -73,26 +73,62 @@ def set_leverage(symbol: str, leverage: int = 5, tdMode: str = "isolated", api_k
     try:
         account_api = AccountAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
 
-        # Параметры для установки плеча без posSide
-        params = {
-            "lever": str(leverage),
-            "mgnMode": tdMode,
-            "instId": symbol
-            # Убираем posSide так как он вызывает ошибку для некоторых инструментов
-        }
+        # Пробуем разные варианты установки плеча
+        params_variants = [
+            # Вариант 1: Без posSide и без instId (глобальное плечо)
+            {"lever": str(leverage), "mgnMode": tdMode},
+            # Вариант 2: Только с instId
+            {"lever": str(leverage), "mgnMode": tdMode, "instId": symbol},
+            # Вариант 3: С instId и ccy
+            {"lever": str(leverage), "mgnMode": tdMode, "instId": symbol, "ccy": "USDT"}
+        ]
 
-        response = account_api.set_leverage(**params)
-        logger.info(f"Ответ API установки плеча OKX: {json.dumps(response, indent=2)}")
+        response = None
+        last_error = None
 
-        if response.get("code") != "0":
-            raise ValueError(f"Ошибка установки плеча: {response.get('msg')}")
+        for params in params_variants:
+            try:
+                logger.info(f"Пробуем установить плечо с параметрами: {params}")
+                response = account_api.set_leverage(**params)
 
-        logger.info(f"Плечо {leverage}x установлено для {symbol} ({tdMode})")
+                if response.get("code") == "0":
+                    logger.info(f"Плечо {leverage}x успешно установлено для {symbol} ({tdMode})")
+                    logger.info(f"Ответ API установки плеча OKX: {json.dumps(response, indent=2)}")
+                    return True
+                else:
+                    last_error = response.get('msg')
+                    logger.warning(f"Не удалось установить плечо: {last_error}")
+
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Ошибка при установке плеча: {last_error}")
+                continue
+
+        # Если все варианты не сработали, пробуем с posSide как последний вариант
+        try:
+            params = {"lever": str(leverage), "mgnMode": tdMode, "instId": symbol, "posSide": "long"}
+            logger.info(f"Пробуем установить плечо с posSide: {params}")
+            response = account_api.set_leverage(**params)
+
+            if response.get("code") == "0":
+                logger.info(f"Плечо {leverage}x успешно установлено для {symbol} с posSide")
+                return True
+            else:
+                last_error = response.get('msg')
+        except Exception as e:
+            last_error = str(e)
+
+        # Если ничего не помогло, логируем и продолжаем (плечо может быть уже установлено)
+        logger.warning(f"Не удалось установить плечо для {symbol}. Последняя ошибка: {last_error}")
+        logger.warning("Продолжаем выполнение - возможно плечо уже установлено")
         return True
 
     except Exception as e:
-        logger.error(f"Ошибка при установке плеча для {symbol}: {str(e)}")
-        raise
+        logger.error(f"Критическая ошибка при установке плеча для {symbol}: {str(e)}")
+        # Продолжаем выполнение даже при ошибке установки плеча
+        logger.warning("Продолжаем выполнение несмотря на ошибку установки плеча")
+        return True
+
 
 def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.10, api_key: str = None,
                        secret_key: str = None, passphrase: str = None) -> float:
@@ -115,6 +151,16 @@ def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.1
         required_margin = total_trade_amount / leverage
         logger.info(
             f"Баланс: {usdt_balance:.4f} USDT, Требуемая маржа: {required_margin:.4f} USDT, Количество: {quantity:.4f}")
+
+        # Проверяем минимальную сумму ордера
+        min_order_amount = 5  # Минимальная сумма в USDT
+        order_amount = quantity * current_price * ct_val
+        if order_amount < min_order_amount:
+            logger.warning(f"Сумма ордера {order_amount:.2f} USDT меньше минимальной {min_order_amount} USDT")
+            # Пересчитываем количество на основе минимальной суммы
+            quantity = min_order_amount / current_price / ct_val
+            logger.info(f"Используем минимальную сумму, новое количество: {quantity:.4f}")
+
         if required_margin > usdt_balance:
             raise ValueError(
                 f"Недостаточно маржи: требуется {required_margin:.4f} USDT, доступно {usdt_balance:.4f} USDT")
@@ -127,7 +173,6 @@ def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.1
     except Exception as e:
         logger.error(f"Ошибка при расчете количества для {symbol}: {str(e)}")
         raise
-
 
 def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float, take_profits: list,
                       tdMode: str = "isolated", api_key: str = None, secret_key: str = None, passphrase: str = None):

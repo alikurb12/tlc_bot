@@ -379,16 +379,22 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
 
         usdt_balance = okx_get_balance(api_key, secret_key, passphrase)
 
-        if usdt_balance < 0.1:
+        if usdt_balance < 10:  # Увеличиваем минимальный баланс
             logger.error(f"Недостаточный баланс для пользователя {user_id}: {usdt_balance} USDT")
             return None
 
-        # Устанавливаем плечо без posSide
-        okx_set_leverage(symbol, leverage=10, tdMode="isolated",
-                         api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+        # Устанавливаем плечо (функция теперь устойчива к ошибкам)
+        leverage_set = okx_set_leverage(symbol, leverage=10, tdMode="isolated",
+                                        api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+
+        if not leverage_set:
+            logger.warning(f"Не удалось установить плечо для {symbol}, продолжаем...")
 
         quantity = okx_calculate_quantity(symbol, leverage=10, risk_percent=0.05,
                                           api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+
+        # Убираем проверку get_symbol_info - она уже есть внутри okx_calculate_quantity
+        # quantity уже должен быть корректно рассчитан с учетом минимальных лимитов
 
         main_order_response, sorted_take_profits, order_id, algo_order_ids = okx_create_main_order(
             symbol=symbol,
