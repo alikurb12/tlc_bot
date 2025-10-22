@@ -30,17 +30,19 @@ from okx_api import (
 
 logger = logging.getLogger(__name__)
 
+
 def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
     user_id = user['user_id']
     api_key = user['api_key']
     secret_key = user['secret_key']
 
     try:
-        # Получаем открытые ордера
-        open_orders_response = bingx_get_open_orders(symbol, api_key, secret_key)
-        open_orders_data = open_orders_response.get("data", {}).get("orders", [])
-
         cursor = get_cursor()
+
+        # Начинаем транзакцию
+        cursor.execute("BEGIN")
+
+        # Получаем открытые сделки
         cursor.execute(
             """
             SELECT trade_id, order_id, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, side
@@ -51,14 +53,20 @@ def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
         )
         open_trades = cursor.fetchall()
 
-        closed = False
-        position_side = "LONG" if current_side == "SELL" else "SHORT"  # Противоположная сторона
+        if not open_trades:
+            cursor.execute("ROLLBACK")
+            logger.info(f"Нет открытых сделок для пользователя {user_id} по символу {symbol}")
+            return True
 
-        # Отменяем все связанные ордера
+        closed = False
+        position_side = "LONG" if current_side == "SELL" else "SHORT"
+
         for trade in open_trades:
             if trade['side'] != current_side:
+                # Отменяем все связанные ордера
                 order_ids = [trade['order_id'], trade['sl_order_id'], trade['tp1_order_id'],
                              trade['tp2_order_id'], trade['tp3_order_id']]
+
                 for order_id in order_ids:
                     if order_id:
                         try:
@@ -72,29 +80,28 @@ def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
                                 logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
                                 continue
 
-        # Закрываем позицию (в режиме хеджирования без reduceOnly)
-        try:
-            bingx_close_position(symbol, position_side, api_key, secret_key)
-            logger.info(f"Позиция {position_side} для {symbol} закрыта")
-            closed = True
-        except Exception as e:
-            if "position not exist" in str(e).lower() or "order not exist" in str(e).lower():
-                logger.info(f"Позиция {position_side} для {symbol} уже не существует")
-            else:
-                logger.error(f"Ошибка при закрытии позиции {position_side} для {symbol}: {str(e)}")
+                # Закрываем позицию
+                try:
+                    bingx_close_position(symbol, position_side, api_key, secret_key)
+                    logger.info(f"Позиция {position_side} для {symbol} закрыта")
+                    closed = True
+                except Exception as e:
+                    if "position not exist" in str(e).lower() or "order not exist" in str(e).lower():
+                        logger.info(f"Позиция {position_side} для {symbol} уже не существует")
+                    else:
+                        logger.error(f"Ошибка при закрытии позиции {position_side} для {symbol}: {str(e)}")
 
-        # Обновляем статус в базе данных для всех открытых сделок противоположной стороны
-        cursor.execute(
-            """
-            UPDATE trades SET status = %s
-            WHERE user_id = %s AND symbol = %s AND status = %s AND side != %s
-            """,
-            ('closed', user_id, symbol, 'open', current_side)
-        )
-        commit()
+                # Обновляем статус в базе данных
+                cursor.execute(
+                    "UPDATE trades SET status = %s WHERE trade_id = %s",
+                    ('closed', trade['trade_id'])
+                )
 
         if closed:
-            # Отправляем уведомление о закрытии сделки
+            commit()
+            logger.info(f"Транзакция завершена для пользователя {user_id}")
+
+            # Отправляем уведомление
             try:
                 notification = {
                     "action": f"CLOSE_{'BUY' if position_side == 'LONG' else 'SELL'}",
@@ -109,14 +116,23 @@ def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
                 asyncio.run_coroutine_threadsafe(
                     send_signal_notification(notification, user_id), loop
                 )
-                logger.info(f"Уведомление о закрытии сделки отправлено для пользователя {user_id}")
             except Exception as notify_error:
                 logger.error(f"Ошибка отправки уведомления о закрытии для {user_id}: {notify_error}")
+        else:
+            cursor.execute("ROLLBACK")
+            logger.info(f"Не было закрытых сделок для пользователя {user_id}")
 
         return closed
 
     except Exception as e:
+        # Откатываем транзакцию при ошибке
+        try:
+            cursor.execute("ROLLBACK")
+        except:
+            pass
         logger.error(f"Ошибка при закрытии сделки BingX для пользователя {user_id}: {str(e)}")
+
+        # Отправляем сообщение об ошибке
         SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@SupportBot")
         try:
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
@@ -379,11 +395,11 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
 
         usdt_balance = okx_get_balance(api_key, secret_key, passphrase)
 
-        if usdt_balance < 10:  # Увеличиваем минимальный баланс
+        if usdt_balance < 10:
             logger.error(f"Недостаточный баланс для пользователя {user_id}: {usdt_balance} USDT")
             return None
 
-        # Устанавливаем плечо (функция теперь устойчива к ошибкам)
+        # Устанавливаем плечо
         leverage_set = okx_set_leverage(symbol, leverage=10, tdMode="isolated",
                                         api_key=api_key, secret_key=secret_key, passphrase=passphrase)
 
@@ -393,10 +409,7 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         quantity = okx_calculate_quantity(symbol, leverage=10, risk_percent=0.05,
                                           api_key=api_key, secret_key=secret_key, passphrase=passphrase)
 
-        # Убираем проверку get_symbol_info - она уже есть внутри okx_calculate_quantity
-        # quantity уже должен быть корректно рассчитан с учетом минимальных лимитов
-
-        main_order_response, sorted_take_profits, order_id, algo_order_ids = okx_create_main_order(
+        main_order_response, sorted_take_profits, order_id, algo_order_ids, position_side = okx_create_main_order(
             symbol=symbol,
             side=action,
             quantity=quantity,
@@ -416,11 +429,11 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         cursor = get_cursor()
         cursor.execute(
             """
-            INSERT INTO trades (user_id, exchange, order_id, symbol, side, quantity, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO trades (user_id, exchange, order_id, symbol, side, position_side, quantity, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING trade_id
             """,
-            (user_id, 'okx', order_id, symbol, action, quantity, price, stop_loss,
+            (user_id, 'okx', order_id, symbol, action, position_side, quantity, price, stop_loss,
              take_profits[0], take_profits[1], take_profits[2], sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id,
              'open')
         )
@@ -438,6 +451,7 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             "user_id": user_id,
             "exchange": "okx",
             "trade_id": trade_id,
+            "position_side": position_side,  # Добавляем position_side в ответ
             "main_order": main_order_response,
             "sl_order_id": sl_order_id,
             "tp1_order_id": tp1_order_id,

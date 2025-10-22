@@ -9,8 +9,34 @@ from database import get_cursor, commit
 
 logger = logging.getLogger(__name__)
 
+import locale
+import sys
+
+try:
+    locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+    except:
+        pass
+
+def safe_json_dumps(data):
+    try:
+        return json.dumps(data, ensure_ascii=False)
+    except UnicodeDecodeError:
+        return json.dumps(data, ensure_ascii=False, default=str)
+
 APIURL = "https://www.okx.com"
 
+
+def determine_position_side(side: str) -> str:
+    # Для OKX используем net позиции или определяем по side
+    if side.upper() == "BUY":
+        return "long"
+    elif side.upper() == "SELL":
+        return "short"
+    else:
+        return "net"
 
 def get_symbol_info(symbol: str, api_key: str, secret_key: str, passphrase: str) -> dict:
     try:
@@ -48,7 +74,10 @@ def get_balance(api_key: str, secret_key: str, passphrase: str) -> float:
     try:
         account_api = AccountAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
         response = account_api.get_account_balance(ccy="USDT")
-        logger.info(f"Ответ API баланса OKX: {json.dumps(response, indent=2)}")
+
+        # Используем безопасную сериализацию для логирования
+        logger.info(f"Ответ API баланса OKX: {safe_json_dumps(response)}")
+
         if response.get("code") != "0":
             raise ValueError(f"Ошибка получения баланса: {response.get('msg')}")
 
@@ -174,10 +203,22 @@ def calculate_quantity(symbol: str, leverage: int = 5, risk_percent: float = 0.1
         logger.error(f"Ошибка при расчете количества для {symbol}: {str(e)}")
         raise
 
+
 def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float, take_profits: list,
                       tdMode: str = "isolated", api_key: str = None, secret_key: str = None, passphrase: str = None):
     try:
         trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
+
+        # Определяем позицию для OKX
+        # Для SWAP контрактов используем net позиции, но некоторые инструменты требуют long/short
+        pos_side = "net"  # По умолчанию net позиция
+
+        # Для некоторых инструментов может потребоваться явное указание long/short
+        # Пробуем определить на основе направления
+        if side.upper() == "BUY":
+            pos_side = "long"
+        elif side.upper() == "SELL":
+            pos_side = "short"
 
         # Определяем направление для SL/TP ордеров
         sl_side = "buy" if side == "SELL" else "sell"
@@ -215,7 +256,10 @@ def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float,
 
         total_tp_size = sum(float(qty) for qty in tp_quantities)
         if abs(total_tp_size - float(quantity_str)) > 0.0001:
-            raise ValueError(f"Сумма размеров TP ({total_tp_size}) не равна размеру основного ордера ({quantity_str})")
+            # Корректируем последнюю часть
+            correction = float(quantity_str) - total_tp_size
+            tp_quantities[-1] = f"{float(tp_quantities[-1]) + correction:.2f}"
+            logger.info(f"Скорректированы TP размеры: {tp_quantities}")
 
         sorted_take_profits = sorted(take_profits) if side == "BUY" else sorted(take_profits, reverse=True)
 
@@ -232,82 +276,130 @@ def create_main_order(symbol: str, side: str, quantity: float, stop_loss: float,
                     "triggerPxType": "last"
                 })
 
-        logger.info(f"TP размеры: {tp_quantities}, сумма: {total_tp_size}, основной ордер: {quantity_str}")
+        logger.info(
+            f"TP размеры: {tp_quantities}, сумма: {sum(float(q) for q in tp_quantities)}, основной ордер: {quantity_str}")
 
-        # Параметры основного ордера
-        order_params = {
-            "instId": symbol,
-            "tdMode": tdMode,
-            "side": side.lower(),
-            "ordType": "market",
-            "sz": quantity_str,
-            "attachAlgoOrds": algo_orders
-            # Убираем posSide так как он вызывает ошибку для некоторых инструментов
-        }
+        # Параметры основного ордера - ПРОБУЕМ РАЗНЫЕ ВАРИАНТЫ
+        order_variants = [
+            # Вариант 1: Без posSide (для инструментов, которые поддерживают net позиции)
+            {
+                "instId": symbol,
+                "tdMode": tdMode,
+                "side": side.lower(),
+                "ordType": "market",
+                "sz": quantity_str,
+                "attachAlgoOrds": algo_orders
+            },
+            # Вариант 2: С posSide = "net"
+            {
+                "instId": symbol,
+                "tdMode": tdMode,
+                "side": side.lower(),
+                "ordType": "market",
+                "sz": quantity_str,
+                "posSide": "net",
+                "attachAlgoOrds": algo_orders
+            },
+            # Вариант 3: С явным posSide (long/short)
+            {
+                "instId": symbol,
+                "tdMode": tdMode,
+                "side": side.lower(),
+                "ordType": "market",
+                "sz": quantity_str,
+                "posSide": pos_side,
+                "attachAlgoOrds": algo_orders
+            }
+        ]
 
-        logger.info(f"Создание ордера с параметрами: {order_params}")
+        response = None
+        last_error = None
 
-        response = trade_api.place_order(**order_params)
-        logger.info(f"Ответ API создания ордера OKX: {json.dumps(response, indent=2)}")
+        for i, order_params in enumerate(order_variants):
+            try:
+                logger.info(f"Попытка {i + 1}: Создание ордера с параметрами: {order_params}")
 
-        if response.get("code") != "0":
-            # Если ошибка из-за posSide, пробуем без attachAlgoOrds сначала создать основной ордер
-            if "Parameter posSide error" in response.get("msg", ""):
-                logger.info("Пробуем создать основной ордер без алгоритмических ордеров...")
+                response = trade_api.place_order(**order_params)
+                logger.info(f"Ответ API создания ордера OKX: {json.dumps(response, indent=2)}")
 
-                # Сначала создаем основной ордер
-                main_order_response = trade_api.place_order(
-                    instId=symbol,
-                    tdMode=tdMode,
-                    side=side.lower(),
-                    ordType="market",
-                    sz=quantity_str
-                )
+                if response.get("code") == "0":
+                    order_id = response["data"][0]["ordId"]
+                    algo_order_ids = [order.get("algoId") for order in response["data"] if order.get("algoId")]
 
-                if main_order_response.get("code") != "0":
-                    raise ValueError(f"Ошибка создания основного ордера: {main_order_response.get('msg')}")
+                    logger.info(f"Ордер успешно создан с вариантом {i + 1}")
+                    return response, sorted_take_profits, order_id, algo_order_ids, order_params.get("posSide", "net")
+                else:
+                    last_error = response.get('msg')
+                    logger.warning(f"Не удалось создать ордер с вариантом {i + 1}: {last_error}")
 
-                order_id = main_order_response["data"][0]["ordId"]
-                logger.info(f"Основной ордер создан: {order_id}")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Ошибка при создании ордера с вариантом {i + 1}: {last_error}")
+                continue
 
-                # Затем создаем алгоритмические ордера отдельно
-                algo_order_ids = []
-                for algo_order in algo_orders:
-                    time.sleep(0.5)  # Задержка между запросами
+        # Если все варианты не сработали, пробуем создать основной ордер без алгоритмических ордеров
+        logger.info("Пробуем создать основной ордер без алгоритмических ордеров...")
 
-                    algo_params = {
-                        "instId": symbol,
-                        "tdMode": tdMode,
-                        "side": algo_order["side"],
-                        "ordType": "conditional",
-                        "sz": algo_order["sz"],
-                        "triggerPxType": algo_order["triggerPxType"]
-                    }
+        main_order_variants = [
+            {"instId": symbol, "tdMode": tdMode, "side": side.lower(), "ordType": "market", "sz": quantity_str},
+            {"instId": symbol, "tdMode": tdMode, "side": side.lower(), "ordType": "market", "sz": quantity_str,
+             "posSide": "net"},
+            {"instId": symbol, "tdMode": tdMode, "side": side.lower(), "ordType": "market", "sz": quantity_str,
+             "posSide": pos_side}
+        ]
 
-                    # Добавляем параметры в зависимости от типа ордера
-                    if algo_order.get("slTriggerPx"):
-                        algo_params["slTriggerPx"] = algo_order["slTriggerPx"]
-                        algo_params["slOrdPx"] = algo_order["slOrdPx"]
-                    else:
-                        algo_params["tpTriggerPx"] = algo_order["tpTriggerPx"]
-                        algo_params["tpOrdPx"] = algo_order["tpOrdPx"]
+        for i, main_params in enumerate(main_order_variants):
+            try:
+                logger.info(f"Попытка основного ордера {i + 1}: {main_params}")
+                main_response = trade_api.place_order(**main_params)
 
-                    algo_response = trade_api.place_algo_order(**algo_params)
-                    if algo_response.get("code") == "0":
-                        algo_id = algo_response["data"][0]["algoId"]
-                        algo_order_ids.append(algo_id)
-                        logger.info(f"Алгоритмический ордер создан: {algo_id}")
-                    else:
-                        logger.error(f"Ошибка создания алгоритмического ордера: {algo_response.get('msg')}")
+                if main_response.get("code") == "0":
+                    order_id = main_response["data"][0]["ordId"]
+                    logger.info(f"Основной ордер создан: {order_id}")
 
-                return main_order_response, sorted_take_profits, order_id, algo_order_ids
-            else:
-                raise ValueError(f"Ошибка создания ордера: {response.get('msg')}")
+                    # Затем создаем алгоритмические ордера отдельно
+                    algo_order_ids = []
+                    for algo_order in algo_orders:
+                        time.sleep(0.5)
 
-        order_id = response["data"][0]["ordId"]
-        algo_order_ids = [order.get("algoId") for order in response["data"] if order.get("algoId")]
+                        algo_params = {
+                            "instId": symbol,
+                            "tdMode": tdMode,
+                            "side": algo_order["side"],
+                            "ordType": "conditional",
+                            "sz": algo_order["sz"],
+                            "triggerPxType": algo_order["triggerPxType"]
+                        }
 
-        return response, sorted_take_profits, order_id, algo_order_ids
+                        # Добавляем posSide если он был использован в основном ордере
+                        if "posSide" in main_params:
+                            algo_params["posSide"] = main_params["posSide"]
+
+                        # Добавляем параметры в зависимости от типа ордера
+                        if algo_order.get("slTriggerPx"):
+                            algo_params["slTriggerPx"] = algo_order["slTriggerPx"]
+                            algo_params["slOrdPx"] = algo_order["slOrdPx"]
+                        else:
+                            algo_params["tpTriggerPx"] = algo_order["tpTriggerPx"]
+                            algo_params["tpOrdPx"] = algo_order["tpOrdPx"]
+
+                        algo_response = trade_api.place_algo_order(**algo_params)
+                        if algo_response.get("code") == "0":
+                            algo_id = algo_response["data"][0]["algoId"]
+                            algo_order_ids.append(algo_id)
+                            logger.info(f"Алгоритмический ордер создан: {algo_id}")
+                        else:
+                            logger.error(f"Ошибка создания алгоритмического ордера: {algo_response.get('msg')}")
+
+                    return main_response, sorted_take_profits, order_id, algo_order_ids, main_params.get("posSide",
+                                                                                                         "net")
+
+            except Exception as e:
+                logger.error(f"Ошибка при создании основного ордера с вариантом {i + 1}: {str(e)}")
+                continue
+
+        # Если ничего не помогло
+        raise ValueError(f"Не удалось создать ордер после всех попыток. Последняя ошибка: {last_error}")
 
     except Exception as e:
         logger.error(f"Ошибка при создании основного ордера для {symbol}: {str(e)}")
@@ -344,7 +436,7 @@ def close_position(symbol: str, posSide: str, api_key: str, secret_key: str, pas
 
 def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str, passphrase: str) -> bool:
     try:
-        trade_api = TradeAPI(api_key, secret_key, passphrase, flag="1", domain=APIURL, debug=True)
+        trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
         response = trade_api.cancel_order(instId=symbol, ordId=order_id)
         logger.info(f"Ответ API отмены ордера OKX: {json.dumps(response, indent=2)}")
         if response.get("code") != "0":
@@ -357,9 +449,7 @@ def cancel_order(symbol: str, order_id: str, api_key: str, secret_key: str, pass
 
 
 def move_sl_to_breakeven(symbol: str, api_key: str, secret_key: str, passphrase: str) -> bool:
-    """
-    Перемещает стоп-лосс к цене входа для OKX
-    """
+
     try:
         trade_api = TradeAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
         account_api = AccountAPI(api_key, secret_key, passphrase, flag="0", domain=APIURL, debug=True)
