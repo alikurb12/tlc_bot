@@ -1,3 +1,4 @@
+# webhook.py
 import json
 import math
 from fastapi import APIRouter, Request, HTTPException
@@ -15,12 +16,10 @@ router = APIRouter()
 def clean_json_data(data_str: str) -> dict:
     """Очищает JSON данные от NaN и других невалидных значений"""
     try:
-        # Заменяем NaN на null (None в Python)
         cleaned_str = data_str.replace(': NaN', ': null').replace(':NaN', ':null')
-        # Парсим JSON
         return json.loads(cleaned_str)
     except json.JSONDecodeError as e:
-        logger.error(f"Ошибка парсинга JSON после очистки: {str(e)}")
+        logger.error(f"Ошибка парсинга JSON: {str(e)}")
         raise
 
 
@@ -49,7 +48,6 @@ async def handle_move_sl_signal(data: dict):
         normalized_symbol = normalize_symbol(symbol, exchange)
 
         try:
-            # Импортируем здесь чтобы избежать циклического импорта
             if exchange == 'bingx':
                 from services import process_bingx_move_sl
                 result = process_bingx_move_sl(user, normalized_symbol)
@@ -81,23 +79,22 @@ async def handle_move_sl_signal(data: dict):
 
 @router.post("/webhook")
 async def webhook(request: Request):
+    """Основной webhook endpoint для торговых сигналов"""
     try:
         raw_data = await request.body()
         raw_data_str = raw_data.decode('utf-8')
-        logger.info(f"Получен запрос: {raw_data_str}")
+        logger.info(f"Получен webhook запрос: {raw_data_str}")
 
         content_type = request.headers.get('Content-Type', '').lower()
 
-        # Принимаем как text/plain так и application/json
         if not content_type or ('application/json' not in content_type and 'text/plain' not in content_type):
-            logger.error(f"Неверный Content-Type: {content_type}. Ожидается application/json или text/plain")
+            logger.error(f"Неверный Content-Type: {content_type}")
             raise HTTPException(status_code=400, detail="Ожидается Content-Type: application/json или text/plain")
 
         try:
-            # Очищаем данные от NaN и парсим JSON
             data = clean_json_data(raw_data_str)
         except Exception as e:
-            logger.error(f"Ошибка парсинга JSON: {str(e)}, тело запроса: {raw_data_str}")
+            logger.error(f"Ошибка парсинга JSON: {str(e)}")
             raise HTTPException(status_code=400, detail=f"Неверный формат JSON: {str(e)}")
 
         if not data:
@@ -106,19 +103,18 @@ async def webhook(request: Request):
 
         raw_action = data.get('action', '').upper()
 
-        # Добавляем обработку MOVE_SL
         if raw_action not in ['BUY', 'SELL', 'LONG', 'SHORT', 'MOVE_SL']:
             logger.error(f"Некорректное действие: {raw_action}")
             raise HTTPException(status_code=400, detail="Действие должно быть BUY, SELL, LONG, SHORT или MOVE_SL")
 
-        # Обработка MOVE_SL
+        # Обработка MOVE_SL (немедленно)
         if raw_action == 'MOVE_SL':
             return await handle_move_sl_signal(data)
 
-        # Остальная логика для BUY/SELL
+        # Обработка торговых сигналов BUY/SELL
         action = raw_action if raw_action in ['BUY', 'SELL'] else ('BUY' if raw_action == 'LONG' else 'SELL')
-
         symbol = data.get('symbol')
+
         if not symbol:
             logger.error("Не указан символ")
             raise HTTPException(status_code=400, detail="Необходимо указать символ")
@@ -161,21 +157,11 @@ async def webhook(request: Request):
             take_profit_3 = None
 
         if not stop_loss or not all([take_profit_1, take_profit_2, take_profit_3]):
-            logger.error("Не указаны все необходимые параметры SL и TP")
-            logger.error(f"SL: {stop_loss}, TP1: {take_profit_1}, TP2: {take_profit_2}, TP3: {take_profit_3}")
+            logger.error(
+                f"Не указаны все SL/TP: SL={stop_loss}, TP1={take_profit_1}, TP2={take_profit_2}, TP3={take_profit_3}")
             raise HTTPException(status_code=400, detail="Необходимо указать stop_loss и все три take_profit")
 
-        # Signal model validation
-        signal_base = Signal(
-            action=action,
-            symbol=symbol,
-            price=price,
-            stop_loss=stop_loss,
-            take_profit_1=take_profit_1,
-            take_profit_2=take_profit_2,
-            take_profit_3=take_profit_3,
-        )
-
+        # Получаем активных пользователей
         cursor = get_cursor()
         cursor.execute(
             "SELECT user_id, api_key, secret_key, passphrase, exchange FROM users WHERE subscription_end > %s AND api_key IS NOT NULL AND secret_key IS NOT NULL AND subscription_type IN ('referral_approved', 'regular')",
@@ -204,7 +190,6 @@ async def webhook(request: Request):
             }
 
             try:
-                # Импортируем здесь чтобы избежать циклического импорта
                 if exchange == 'bingx':
                     from services import process_bingx_signal
                     result = process_bingx_signal(user, signal)
