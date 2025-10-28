@@ -111,7 +111,7 @@ conn.commit()
 
 # ------------------- Тарифы -------------------
 TARIFFS = {
-    '1month': {'days': 30, 'price': 5, 'name': '1 месяц', 'currency': 'RUB'},
+    '1month': {'days': 30, 'price': 500, 'name': '1 месяц', 'currency': 'RUB'},
     '3months': {'days': 90, 'price': 1200, 'name': '3 месяца', 'currency': 'RUB'},
 }
 
