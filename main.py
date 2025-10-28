@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import datetime
+import uuid
 from dotenv import load_dotenv
 import os
 import psycopg2
@@ -13,7 +14,7 @@ from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.enums.chat_member_status import ChatMemberStatus
 import aiohttp
-import requests
+from yoomoney import Client, Quickpay
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -36,6 +37,9 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
+
+# ------------------- YooMoney клиент -------------------
+yoomoney_client = Client(YOOMONEY_ACCESS_TOKEN)
 
 # ------------------- База данных -------------------
 try:
@@ -83,51 +87,33 @@ cursor.execute("""
     )
 """)
 
-# Проверки и добавление столбцов
-cursor.execute("""
-    SELECT column_name 
-    FROM information_schema.columns 
-    WHERE table_name = 'users' AND column_name = 'chat_id';
-""")
-if not cursor.fetchone():
-    cursor.execute("ALTER TABLE users ADD COLUMN chat_id BIGINT;")
-    conn.commit()
-
-cursor.execute("""
-    SELECT column_name 
-    FROM information_schema.columns 
-    WHERE table_name = 'users' AND column_name = 'passphrase';
-""")
-if not cursor.fetchone():
-    cursor.execute("ALTER TABLE users ADD COLUMN passphrase TEXT;")
-    conn.commit()
-
-cursor.execute("""
-    SELECT column_name 
-    FROM information_schema.columns 
-    WHERE table_name = 'payments' AND column_name = 'payment_method';
-""")
-if not cursor.fetchone():
-    cursor.execute("ALTER TABLE payments ADD COLUMN payment_method TEXT DEFAULT 'yoomoney';")
-    conn.commit()
-
-cursor.execute("""
-    SELECT column_name 
-    FROM information_schema.columns 
-    WHERE table_name = 'payments' AND column_name = 'yoomoney_label';
-""")
-if not cursor.fetchone():
-    cursor.execute("ALTER TABLE payments ADD COLUMN yoomoney_label TEXT;")
-    conn.commit()
+# Добавление недостающих столбцов (если их нет)
+for col, sql in [
+    ("chat_id", "ALTER TABLE users ADD COLUMN chat_id BIGINT;"),
+    ("passphrase", "ALTER TABLE users ADD COLUMN passphrase TEXT;"),
+    ("payment_method", "ALTER TABLE payments ADD COLUMN payment_method TEXT DEFAULT 'yoomoney';"),
+    ("yoomoney_label", "ALTER TABLE payments ADD COLUMN yoomoney_label TEXT;")
+]:
+    cursor.execute(f"""
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'users' AND column_name = %s
+        UNION
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'payments' AND column_name = %s;
+    """, (col, col))
+    if not cursor.fetchone():
+        cursor.execute(sql)
+        conn.commit()
 
 conn.commit()
 
 # ------------------- Тарифы -------------------
 TARIFFS = {
-    '1month': {'days': 30, 'price': 500, 'name': '1 месяц', 'currency': 'RUB'},
+    '1month': {'days': 30, 'price': 5, 'name': '1 месяц', 'currency': 'RUB'},
     '3months': {'days': 90, 'price': 1200, 'name': '3 месяца', 'currency': 'RUB'},
 }
-
 
 # ------------------- Состояния -------------------
 class PaymentStates(StatesGroup):
@@ -139,186 +125,154 @@ class PaymentStates(StatesGroup):
     waiting_for_secret_key = State()
     waiting_for_passphrase = State()
 
-
-# ------------------- YooMoney -------------------
+# ------------------- YooMoney функции -------------------
 def create_yoomoney_payment(user_id: int, amount: float, description: str):
-    """
-    Генерация QuickPay ссылки YooMoney.
-    """
-    label = f"user_{user_id}"
-    pay_url = (
-        f"https://yoomoney.ru/quickpay/confirm.xml?"
-        f"receiver={YOOMONEY_RECEIVER}&"
-        f"quickpay-form=donate&"
-        f"targets={description}&"
-        f"paymentType=SB&"  # SB - Сбербанк, AC - карта
-        f"sum={amount}&"
-        f"label={label}"
+    """Создаёт QuickPay-платёж и возвращает URL и уникальный label."""
+    label = f"user_{user_id}_{uuid.uuid4().hex[:8]}"
+    quickpay = Quickpay(
+        receiver=YOOMONEY_RECEIVER,
+        quickpay_form="shop",
+        targets=description,
+        paymentType="SB",          # SB – карта Сбербанка, AC – любая карта
+        sum=amount,
+        label=label
     )
-    return {"status": "success", "pay_url": pay_url, "label": label}
-
-
-def check_yoomoney_payment(label: str):
-    """
-    Проверка входящих платежей по метке через YooMoney API.
-    """
-    url = "https://yoomoney.ru/api/operation-history"
-    headers = {
-        "Authorization": f"Bearer {YOOMONEY_ACCESS_TOKEN}",
-        "Content-Type": "application/x-www-form-urlencoded"
+    return {
+        "status": "success",
+        "pay_url": quickpay.redirected_url,
+        "label": label
     }
-    data = {
-        "type": "deposition",
-        "label": label,
-        "records": 10
-    }
+
+def check_yoomoney_payment(label: str) -> bool:
+    """Проверяет, прошёл ли платёж с указанным label."""
     try:
-        response = requests.post(url, headers=headers, data=data)
-        response.raise_for_status()
-        operations = response.json().get("operations", [])
-        for op in operations:
-            if op.get("label") == label and op.get("status") == "success":
+        history = yoomoney_client.operation_history(label=label)
+        for op in history.operations:
+            if op.label == label and op.status == "success":
                 return True
         return False
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Ошибка проверки YooMoney: {e}")
+    except Exception as e:
+        logging.error(f"YooMoney check error: {e}")
         return False
-
 
 # ------------------- Клавиатуры -------------------
 def get_subscription_type_keyboard():
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+    return types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="Обычная подписка", callback_data="subscription:regular")],
         [types.InlineKeyboardButton(text="Реферальная подписка", callback_data="subscription:referral")],
-        [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+        [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
     ])
-    return keyboard
-
 
 def get_tariffs_keyboard():
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[])
     for tariff_id, tariff in TARIFFS.items():
-        keyboard.inline_keyboard.append([types.InlineKeyboardButton(
-            callback_data=f"tariff:{tariff_id}",
-            text=f"{tariff['name']} - {tariff['price']}₽"
+        kb.inline_keyboard.append([types.InlineKeyboardButton(
+            text=f"{tariff['name']} – {tariff['price']}₽",
+            callback_data=f"tariff:{tariff_id}"
         )])
-    keyboard.inline_keyboard.append(
-        [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")])
-    return keyboard
-
+    kb.inline_keyboard.append([types.InlineKeyboardButton(
+        text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}"
+    )])
+    return kb
 
 def get_exchange_keyboard():
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+    return types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="BingX", callback_data="exchange:bingx"),
          types.InlineKeyboardButton(text="OKX", callback_data="exchange:okx")],
-        [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+        [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
     ])
-    return keyboard
-
 
 def get_main_menu(user_id):
     buttons = [[types.KeyboardButton(text="Подключить API")]]
     cursor.execute("SELECT subscription_end FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-    if result and result['subscription_end'] is not None and result['subscription_end'] > datetime.datetime.now():
+    res = cursor.fetchone()
+    if res and res['subscription_end'] and res['subscription_end'] > datetime.datetime.now():
         buttons.append([types.KeyboardButton(text="Информация о подписке")])
-    buttons.append([types.KeyboardButton(text="📞 Поддержка")])
-    keyboard = types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=False)
-    return keyboard
-
+    buttons.append([types.KeyboardButton(text="Поддержка")])
+    return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 # ------------------- Вспомогательные функции -------------------
 async def is_bot_in_group():
     try:
-        print(f"Checking bot in group: {GROUP_ID}")
         member = await bot.get_chat_member(chat_id=GROUP_ID, user_id=bot.id)
         return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR]
     except TelegramForbiddenError:
-        logging.error("Бот не добавлен в группу или не имеет доступа.")
         return False
     except Exception as e:
-        logging.error(f"Ошибка при проверке нахождения бота в группе: {e}")
+        logging.error(f"Ошибка проверки бота в группе: {e}")
         return False
-
 
 VIDEO_INSTRUCTIONS = {
     'bingx': 'videos/bingx.mp4',
     'okx': 'videos/okx.mp4'
 }
 
-
 # ------------------- Обработчики команд -------------------
 @router.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    is_in_group = await is_bot_in_group()
-    if not is_in_group:
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
+    if not await is_bot_in_group():
         await message.answer(
-            "❌ Бот не состоит в группе или не имеет доступа. Пожалуйста, добавьте бота в группу и назначьте его администратором.",
-            reply_markup=keyboard
+            "Бот не состоит в группе или не имеет прав администратора.\n"
+            "Добавьте бота в группу и дайте ему права администратора.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")
+            ]])
         )
         return
 
-    user_id = message.from_user.id
-    cursor.execute("SELECT subscription_end, subscription_type FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-
     await message.answer(
-        "Данный бот предоставляет вам возможность пользоваться автоматизированной версией нашей торговой стратегии без надобности выходить за пределы Telegram.\n"
-        "Вам остается лишь один раз провести небольшую настройку, после чего вы сможете пользоваться стратегией и с помощью этого бота.\n"
-        "Для начала вам нужно выбрать тип вашей подписки",
+        "Добро пожаловать! Выберите тип подписки:",
         reply_markup=get_subscription_type_keyboard()
     )
     await state.set_state(PaymentStates.waiting_for_subscription_type)
 
-
 @router.callback_query(F.data.startswith("subscription:"))
 async def process_subscription_type(callback_query: types.CallbackQuery, state: FSMContext):
-    subscription_type = callback_query.data.split(":")[1]
+    sub_type = callback_query.data.split(":")[1]
     user_id = callback_query.from_user.id
     await callback_query.answer()
 
     cursor.execute("SELECT subscription_type FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
+    cur = cursor.fetchone()
 
-    if subscription_type == "referral":
-        if result and result['subscription_type'] == "referral_approved":
+    if sub_type == "referral":
+        if cur and cur['subscription_type'] == "referral_approved":
             await callback_query.message.edit_text(
-                "✅ У вас уже есть подтверждённая реферальная подписка. Выберите биржу для подключения API:",
+                "У вас уже подтверждённая реферальная подписка.\nВыберите биржу:",
                 reply_markup=get_exchange_keyboard()
             )
             await state.set_state(PaymentStates.waiting_for_api_key)
             return
-        elif result and result['subscription_type'] == "referral_pending":
-            keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-            ])
+        if cur and cur['subscription_type'] == "referral_pending":
             await callback_query.message.edit_text(
-                "⏳ Ваш предыдущий UUID ещё на модерации. Пожалуйста, дождитесь ответа.",
-                reply_markup=keyboard
+                "Ваш UUID уже на модерации. Дождитесь ответа.",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                    types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")
+                ]])
             )
             return
+
         await callback_query.message.edit_text(
             "Выберите биржу для реферальной подписки:",
             reply_markup=get_exchange_keyboard()
         )
-        await state.update_data(subscription_type=subscription_type, user_id=user_id)
+        await state.update_data(subscription_type="referral")
         await state.set_state(PaymentStates.waiting_for_exchange)
     else:
         cursor.execute(
-            "INSERT INTO users (user_id, chat_id, subscription_type) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET chat_id = %s, subscription_type = %s",
+            """INSERT INTO users (user_id, chat_id, subscription_type)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (user_id) DO UPDATE
+               SET chat_id = %s, subscription_type = %s""",
             (user_id, user_id, "regular", user_id, "regular")
         )
         conn.commit()
         await callback_query.message.edit_text(
-            "Выберите тариф для подписки:",
+            "Выберите тариф:",
             reply_markup=get_tariffs_keyboard()
         )
         await state.update_data(subscription_type="regular")
         await state.set_state(PaymentStates.waiting_for_payment)
-
 
 @router.callback_query(F.data.startswith("tariff:"))
 async def process_tariff_selection(callback_query: types.CallbackQuery, state: FSMContext):
@@ -327,604 +281,445 @@ async def process_tariff_selection(callback_query: types.CallbackQuery, state: F
     await callback_query.answer()
 
     if tariff_id not in TARIFFS:
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await callback_query.message.edit_text("❌ Неверный тариф. Пожалуйста, выберите снова:", reply_markup=keyboard)
+        await callback_query.message.edit_text(
+            "Неверный тариф. Выберите снова:",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")
+            ]])
+        )
         return
 
     tariff = TARIFFS[tariff_id]
     description = f"Подписка {tariff['name']}"
 
-    # Создаем платеж в YooMoney
-    payment_result = create_yoomoney_payment(user_id, tariff['price'], description)
-
-    if payment_result["status"] != "success":
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
+    payment = create_yoomoney_payment(user_id, tariff['price'], description)
+    if payment["status"] != "success":
         await callback_query.message.edit_text(
-            "❌ Ошибка при создании платежа. Попробуйте позже или свяжитесь с поддержкой.",
-            reply_markup=keyboard
+            "Ошибка создания платежа. Попробуйте позже.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")
+            ]])
         )
         return
 
-    # Сохраняем в базу данных
-    invoice_id = f"yoomoney_{payment_result['label']}"
+    invoice_id = f"yoomoney_{payment['label']}"
     cursor.execute(
-        "INSERT INTO payments (invoice_id, user_id, amount, currency, status, tariff_id, payment_method, yoomoney_label) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (invoice_id, user_id, tariff['price'], "RUB", "pending", tariff_id, "yoomoney", payment_result['label'])
+        """INSERT INTO payments
+           (invoice_id, user_id, amount, currency, status, tariff_id, payment_method, yoomoney_label)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+        (invoice_id, user_id, tariff['price'], "RUB", "pending", tariff_id, "yoomoney", payment['label'])
     )
     conn.commit()
 
-    # Отправляем пользователю ссылку для оплаты
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="💳 Оплатить", url=payment_result["pay_url"])],
-        [types.InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"check_payment:{payment_result['label']}")],
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="Оплатить", url=payment["pay_url"])],
+        [types.InlineKeyboardButton(text="Я оплатил", callback_data=f"check_payment:{payment['label']}")],
         [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
-        [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+        [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
     ])
 
     await callback_query.message.edit_text(
-        f"💳 Оплатите <b>{tariff['price']}₽</b> за <b>{tariff['name']}</b>\n"
-        f"🔗 <a href='{payment_result['pay_url']}'>Ссылка для оплаты</a>\n\n"
-        f"После оплаты нажмите кнопку ниже 👇",
+        f"Оплатите <b>{tariff['price']}₽</b> за <b>{tariff['name']}</b>\n"
+        f"<a href='{payment['pay_url']}'>Ссылка для оплаты</a>\n\n"
+        f"После оплаты нажмите кнопку ниже",
         parse_mode="HTML",
-        reply_markup=keyboard
+        reply_markup=kb
     )
-    await state.update_data(
-        tariff_id=tariff_id,
-        yoomoney_label=payment_result['label'],
-        invoice_id=invoice_id
-    )
+    await state.update_data(tariff_id=tariff_id, yoomoney_label=payment['label'], invoice_id=invoice_id)
     await state.set_state(PaymentStates.waiting_for_payment)
-
 
 @router.callback_query(F.data.startswith("check_payment:"))
 async def check_payment_callback(callback_query: types.CallbackQuery, state: FSMContext):
     label = callback_query.data.split(":")[1]
     user_id = callback_query.from_user.id
-    await callback_query.answer("🔄 Проверяем оплату, подождите...")
+    await callback_query.answer("Проверяем…")
 
-    # Проверяем статус платежа
-    paid = check_yoomoney_payment(label)
-
-    if paid:
-        # Находим данные платежа
-        cursor.execute(
-            "SELECT user_id, tariff_id FROM payments WHERE yoomoney_label = %s",
-            (label,)
-        )
+    if check_yoomoney_payment(label):
+        cursor.execute("SELECT tariff_id FROM payments WHERE yoomoney_label = %s", (label,))
         payment = cursor.fetchone()
+        if not payment:
+            await callback_query.message.edit_text("Платёж не найден в базе.")
+            return
 
-        if payment:
-            tariff = TARIFFS.get(payment['tariff_id'])
-            if tariff:
-                # Обновляем подписку
-                subscription_end = datetime.datetime.now() + datetime.timedelta(days=tariff['days'])
-                cursor.execute(
-                    "UPDATE users SET subscription_end = %s, subscription_type = %s WHERE user_id = %s",
-                    (subscription_end, "regular", payment['user_id'])
-                )
-                cursor.execute(
-                    "UPDATE payments SET status = %s WHERE yoomoney_label = %s",
-                    ("completed", label)
-                )
-                conn.commit()
+        tariff = TARIFFS.get(payment['tariff_id'])
+        if not tariff:
+            await callback_query.message.edit_text("Тариф не найден.")
+            return
 
-                await callback_query.message.edit_text(
-                    f"✅ Оплата подтверждена!\n"
-                    f"🔓 Подписка активна до <b>{subscription_end.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
-                    f"Теперь вы можете подключить API для автоматической торговли.",
-                    parse_mode="HTML",
-                    reply_markup=get_main_menu(user_id)
-                )
-                await state.clear()
-                return
+        end = datetime.datetime.now() + datetime.timedelta(days=tariff['days'])
+        cursor.execute(
+            "UPDATE users SET subscription_end = %s, subscription_type = %s WHERE user_id = %s",
+            (end, "regular", user_id)
+        )
+        cursor.execute("UPDATE payments SET status = %s WHERE yoomoney_label = %s", ("completed", label))
+        conn.commit()
 
-    # Если платеж еще не прошел
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="🔄 Проверить снова", callback_data=f"check_payment:{label}")],
-        [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-    ])
-    await callback_query.message.edit_text(
-        "⏳ Платёж ещё не подтверждён. Попробуйте проверить статус через несколько секунд.",
-        reply_markup=keyboard
-    )
+        # УБИРАЕМ reply_markup из edit_text
+        await callback_query.message.edit_text(
+            f"Оплата подтверждена!\n"
+            f"Подписка активна до <b>{end.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+            f"Теперь подключите API.",
+            parse_mode="HTML"
+        )
 
+        # Отправляем обычную клавиатуру отдельно
+        await bot.send_message(
+            user_id,
+            "Выберите действие:",
+            reply_markup=get_main_menu(user_id)
+        )
+        await state.clear()
+    else:
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="Проверить снова", callback_data=f"check_payment:{label}")],
+            [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+        ])
+        await callback_query.message.edit_text(
+            "Платёж ещё не подтверждён. Подождите 10-30 сек. и попробуйте снова.",
+            reply_markup=kb
+        )
 
 @router.message(Command("status"))
 async def cmd_status(message: types.Message):
     user_id = message.from_user.id
     cursor.execute("SELECT subscription_end, subscription_type FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-
-    if not result or not result['subscription_end']:
-        await message.answer("❌ У вас нет активной подписки.")
+    res = cursor.fetchone()
+    if not res or not res['subscription_end']:
+        await message.answer("У вас нет активной подписки.")
         return
-
-    end_date = result['subscription_end']
+    end = res['subscription_end']
     now = datetime.datetime.now()
-
-    if end_date < now:
-        await message.answer("⚠️ Ваша подписка истекла.")
+    if end < now:
+        await message.answer("Подписка истекла.")
     else:
-        remain = end_date - now
         await message.answer(
-            f"✅ Ваша подписка активна до <b>{end_date.strftime('%d.%m.%Y %H:%M')}</b>\n"
-            f"🕓 Осталось примерно <b>{remain.days}</b> дней.\n"
-            f"📊 Тип подписки: <b>{result['subscription_type']}</b>",
+            f"Подписка активна до <b>{end.strftime('%d.%m.%Y %H:%M')}</b>\n"
+            f"Осталось примерно <b>{(end - now).days}</b> дней.\n"
+            f"Тип: <b>{res['subscription_type']}</b>",
             parse_mode="HTML",
             reply_markup=get_main_menu(user_id)
         )
 
-
-# ------------------- Обработчики для реферальной системы -------------------
+# ------------------- Реферальная система -------------------
 @router.callback_query(F.data.startswith("exchange:"))
 async def process_exchange(callback_query: types.CallbackQuery, state: FSMContext):
-    exchange = callback_query.data.split(":")[1]
     user_id = callback_query.from_user.id
-    video_path = VIDEO_INSTRUCTIONS.get(exchange)
+    exchange = callback_query.data.split(":")[1]
 
-    if not video_path or not os.path.exists(video_path):
-        logging.error(f"Video file for {exchange} not found at {video_path}")
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        try:
-            await callback_query.message.edit_text(
-                "❌ Ошибка: Видеоинструкция для выбранной биржи недоступна. Пожалуйста, свяжитесь с поддержкой.",
-                reply_markup=keyboard
-            )
-        except TelegramBadRequest:
-            await bot.send_message(
-                chat_id=user_id,
-                text="❌ Ошибка: Видеоинструкция для выбранной биржи недоступна. Пожалуйста, свяжитесь с поддержкой.",
-                reply_markup=keyboard
-            )
-        return
+    cursor.execute("SELECT subscription_type FROM users WHERE user_id = %s", (user_id,))
+    res = cursor.fetchone()
 
-    try:
-        for attempt in range(3):
-            try:
-                await bot.send_video(
-                    chat_id=user_id,
-                    video=types.FSInputFile(video_path),
-                    caption=f"📹 Ознакомьтесь с видеоинструкцией по созданию API-ключа для {exchange.upper()}:",
-                    request_timeout=100
-                )
-                break
-            except aiohttp.ClientError as e:
-                logging.warning(f"Attempt {attempt + 1} failed for user {user_id}: {e}")
-                if attempt == 2:
-                    logging.error(f"All attempts to send video for {exchange} to user {user_id} failed")
-                    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-                        [types.InlineKeyboardButton(text="📞 Поддержка",
-                                                    url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-                    ])
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text="❌ Ошибка при отправке видеоинструкции из-за сетевых проблем. Пожалуйста, попробуйте снова позже.",
-                        reply_markup=keyboard
-                    )
-                    return
-                await asyncio.sleep(2)
+    # === ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ (regular) ===
+    if res['subscription_type'] == "regular":
+        cursor.execute("UPDATE users SET exchange = %s WHERE user_id = %s", (exchange, user_id))
+        conn.commit()
 
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
+        # Редактируем сообщение — без клавиатуры
+        await callback_query.message.edit_text(
+            f"Биржа {exchange.upper()} выбрана.\n\nВведите ваш API-ключ:"
+        )
+
+        # Отправляем новое сообщение + убираем клавиатуру
         await bot.send_message(
+            user_id,
+            "Введите ваш API-ключ:",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+
+        await state.update_data(exchange=exchange)
+        await state.set_state(PaymentStates.waiting_for_api_key)
+
+    # === ДЛЯ РЕФЕРАЛОВ (referral_approved) ===
+    elif res['subscription_type'] == "referral_approved":
+        video_path = VIDEO_INSTRUCTIONS.get(exchange)
+        if not video_path or not os.path.exists(video_path):
+            await callback_query.message.edit_text(
+                "Видеоинструкция недоступна. Обратитесь в поддержку.",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                    types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")
+                ]])
+            )
+            return
+
+        await bot.send_video(
             chat_id=user_id,
-            text="📎 Пожалуйста, введите ваш UUID с биржи для модерации:",
-            reply_markup=keyboard
+            video=types.FSInputFile(video_path),
+            caption=f"Инструкция по созданию API-ключа на {exchange.upper()}:"
+        )
+
+        await bot.send_message(
+            user_id,
+            "Введите ваш UUID с биржи:",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
+                [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+            ])
         )
         await state.update_data(exchange=exchange)
         await state.set_state(PaymentStates.waiting_for_referral_uuid)
-        logging.info(f"Exchange selected: {exchange} for user {user_id}, video sent: {video_path}")
 
-    except TelegramForbiddenError:
-        logging.error(f"User {user_id} blocked the bot")
-        try:
-            await bot.send_message(
-                chat_id=MODERATOR_GROUP_ID,
-                text=f"Пользователь {user_id} заблокировал бота при попытке отправки видео для {exchange}."
-            )
-        except Exception as mod_error:
-            logging.error(f"Failed to notify moderator group about user {user_id} blocking bot: {mod_error}")
-        try:
-            await callback_query.message.edit_text(
-                "❌ Вы заблокировали бота. Разблокируйте, чтобы продолжить."
-            )
-        except TelegramBadRequest:
-            pass
-    except Exception as e:
-        logging.error(f"Unexpected error sending video for {exchange} to user {user_id}: {e}")
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text="❌ Произошла ошибка. Пожалуйста, попробуйте снова или свяжитесь с поддержкой.",
-                reply_markup=keyboard
-            )
-        except TelegramBadRequest:
-            await bot.send_message(
-                chat_id=MODERATOR_GROUP_ID,
-                text=f"Не удалось отправить сообщение пользователю {user_id} из-за ошибки: {e}"
-            )
-
+    else:
+        await callback_query.answer("Ошибка доступа.", show_alert=True)
 
 @router.message(PaymentStates.waiting_for_referral_uuid)
 async def process_referral_uuid(message: types.Message, state: FSMContext):
+    uuid_text = message.text.strip()
     user_id = message.from_user.id
-    referral_uuid = message.text.strip()
     data = await state.get_data()
     exchange = data.get('exchange')
-    logging.info(f"Processing UUID {referral_uuid} for user {user_id}, exchange: {exchange}")
 
-    if len(referral_uuid) < 8:
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer("❌ Неверный формат UUID. Пожалуйста, попробуйте снова:", reply_markup=keyboard)
+    if len(uuid_text) < 8:
+        await message.answer("UUID слишком короткий. Попробуйте снова.")
         return
 
-    cursor.execute("SELECT subscription_type, subscription_end, api_key FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
+    cursor.execute("SELECT subscription_type FROM users WHERE user_id = %s", (user_id,))
+    cur = cursor.fetchone()
 
-    if result and result['subscription_type'] == "referral_pending":
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer("⏳ Ваш предыдущий UUID ещё на модерации. Пожалуйста, дождитесь ответа.",
-                             reply_markup=keyboard)
+    if cur and cur['subscription_type'] == "referral_pending":
+        await message.answer("Ваш предыдущий UUID уже на модерации.")
         return
-    elif result and result['subscription_type'] == "referral_approved" and result[
-        'subscription_end'] > datetime.datetime.now():
-        if result['api_key']:
-            await message.answer(
-                "✅ У вас уже есть активная реферальная подписка и подключённая автоторговля. Выберите действие:",
-                reply_markup=get_main_menu(user_id)
-            )
-        else:
-            await message.answer(
-                "✅ У вас уже есть активная реферальная подписка. Введите ваш API-ключ:",
-                reply_markup=types.ReplyKeyboardRemove()
-            )
-            await state.set_state(PaymentStates.waiting_for_api_key)
+    if cur and cur['subscription_type'] == "referral_approved":
+        await message.answer(
+            "У вас уже подтверждённая реферальная подписка.",
+            reply_markup=get_main_menu(user_id)
+        )
+        await state.clear()
         return
 
     cursor.execute(
-        "INSERT INTO users (user_id, chat_id, subscription_type, referral_uuid, exchange) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET chat_id = %s, subscription_type = %s, referral_uuid = %s, exchange = %s",
-        (user_id, user_id, "referral_pending", referral_uuid, exchange, user_id, "referral_pending", referral_uuid,
-         exchange)
+        """INSERT INTO users (user_id, chat_id, subscription_type, referral_uuid, exchange)
+           VALUES (%s, %s, %s, %s, %s)
+           ON CONFLICT (user_id) DO UPDATE
+           SET subscription_type = %s, referral_uuid = %s, exchange = %s""",
+        (user_id, user_id, "referral_pending", uuid_text, exchange,
+         "referral_pending", uuid_text, exchange)
     )
     conn.commit()
 
-    try:
-        await bot.send_message(
-            MODERATOR_GROUP_ID,
-            f"Новый запрос на реферальную подписку:\n"
-            f"Пользователь: {user_id}\n"
-            f"Биржа: {exchange.upper()}\n"
-            f"UUID: {referral_uuid}\n"
-            f"Пожалуйста, подтвердите или отклоните запрос.",
-            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve_uuid:{user_id}")],
-                [types.InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_uuid:{user_id}")]
-            ])
-        )
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+    await bot.send_message(
+        MODERATOR_GROUP_ID,
+        f"Новый запрос реферальной подписки:\n"
+        f"Пользователь: {user_id}\n"
+        f"Биржа: {exchange.upper()}\n"
+        f"UUID: {uuid_text}",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="Подтвердить", callback_data=f"approve_uuid:{user_id}")],
+            [types.InlineKeyboardButton(text="Отклонить", callback_data=f"reject_uuid:{user_id}")]
         ])
-        await message.answer(
-            "✅ UUID отправлен на модерацию. Ожидайте подтверждения от модератора.",
-            reply_markup=keyboard
-        )
-        await state.update_data(referral_uuid=referral_uuid)
-    except Exception as e:
-        logging.error(f"Ошибка отправки UUID модератору: {e}")
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer("❌ Ошибка при отправке UUID. Попробуйте позже.", reply_markup=keyboard)
-        await state.clear()
-
+    )
+    await message.answer(
+        "UUID отправлен модератору. Ожидайте подтверждения.",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")
+        ]])
+    )
+    await state.update_data(referral_uuid=uuid_text)
 
 @router.callback_query(F.data.startswith("approve_uuid:") | F.data.startswith("reject_uuid:"))
-async def process_moderator_decision(callback_query: types.CallbackQuery, state: FSMContext):
-    try:
-        logging.info(f"Processing callback: {callback_query.data}")
-        action, user_id = callback_query.data.split(":")
-        user_id = int(user_id)
-        await callback_query.answer()
+async def moderator_decision(callback_query: types.CallbackQuery, state: FSMContext):
+    action, uid = callback_query.data.split(":")
+    user_id = int(uid)
+    await callback_query.answer()
 
-        if action == "approve_uuid":
-            logging.info(f"Approving UUID for user {user_id}")
-            subscription_end = datetime.datetime.now() + datetime.timedelta(days=365)
-            cursor.execute(
-                "UPDATE users SET subscription_type = %s, subscription_end = %s WHERE user_id = %s",
-                ("referral_approved", subscription_end, user_id)
-            )
-            conn.commit()
-            try:
-                cursor.execute("SELECT api_key, exchange FROM users WHERE user_id = %s", (user_id,))
-                result = cursor.fetchone()
-                current_state = await state.get_state()
-                logging.info(f"Current state for user {user_id} after UUID approval: {current_state}")
-                if result['api_key']:
-                    await bot.send_message(
-                        user_id,
-                        "✅ Ваш UUID подтверждён модератором! API-ключ уже подключён. Выберите действие:",
-                        reply_markup=get_main_menu(user_id)
-                    )
-                    await state.clear()
-                else:
-                    await bot.send_message(
-                        user_id,
-                        '''
-Для успешной автоматизации вам нужно будет предоставить API-ключ и Secret Key с вашей биржи. 
-ВАЖНО! Мы не используем ваши данные в личных целях и не передаем их третьим лицам! 
-Все данные хранятся в защищенной базе данных и используются только для отправки команд на биржу.
-Пожалуйста, введите ваш API-ключ:
-''',
-                        reply_markup=types.ReplyKeyboardRemove()
-                    )
-                    await state.update_data(exchange=result['exchange'])
-                    await state.set_state(PaymentStates.waiting_for_api_key)
-                await callback_query.message.edit_text(
-                    f"Решение по UUID для пользователя {user_id}: Подтверждено"
-                )
-            except TelegramForbiddenError:
-                logging.error(f"Cannot send message to user {user_id}: Bot is blocked")
-                await callback_query.message.edit_text(
-                    f"Решение по UUID для пользователя {user_id}: Подтверждено, но пользователь заблокировал бота"
-                )
-            except TelegramBadRequest as e:
-                logging.error(f"Telegram error for user {user_id}: {e}")
-                await callback_query.message.edit_text(
-                    f"Решение по UUID для пользователя {user_id}: Подтверждено, но не удалось отправить сообщение"
-                )
-        else:  # reject_uuid
-            logging.info(f"Rejecting UUID for user {user_id}")
-            cursor.execute(
-                "UPDATE users SET subscription_type = %s, referral_uuid = NULL WHERE user_id = %s",
-                ("rejected", user_id)
-            )
-            conn.commit()
-            try:
+    if action == "approve_uuid":
+        end = datetime.datetime.now() + datetime.timedelta(days=365)
+        cursor.execute(
+            "UPDATE users SET subscription_type = %s, subscription_end = %s WHERE user_id = %s",
+            ("referral_approved", end, user_id)
+        )
+        conn.commit()
+        try:
+            cursor.execute("SELECT api_key, exchange FROM users WHERE user_id = %s", (user_id,))
+            res = cursor.fetchone()
+            if res['api_key']:
                 await bot.send_message(
                     user_id,
-                    "❌ Ваш UUID отклонён модератором. Вы можете выбрать обычную подписку или попробовать снова:",
-                    reply_markup=get_subscription_type_keyboard()
+                    "UUID подтверждён! API уже подключён.",
+                    reply_markup=get_main_menu(user_id)
                 )
-                await state.set_state(PaymentStates.waiting_for_subscription_type)
-                await callback_query.message.edit_text(
-                    f"Решение по UUID для пользователя {user_id}: Отклонено"
+            else:
+                await bot.send_message(
+                    user_id,
+                    "UUID подтверждён! Введите API-ключ:",
+                    reply_markup=types.ReplyKeyboardRemove()
                 )
-            except TelegramForbiddenError:
-                logging.error(f"Cannot send message to user {user_id}: Bot is blocked")
-                await callback_query.message.edit_text(
-                    f"Решение по UUID для пользователя {user_id}: Отклонено, но пользователь заблокировал бота"
-                )
-            except TelegramBadRequest as e:
-                logging.error(f"Telegram error for user {user_id}: {e}")
-                await callback_query.message.edit_text(
-                    f"Решение по UUID для пользователя {user_id}: Отклонено, но не удалось отправить сообщение"
-                )
-    except Exception as e:
-        logging.error(f"Error processing moderator decision for callback {callback_query.data}: {e}")
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await callback_query.message.edit_text("❌ Ошибка при обработке решения. Попробуйте снова.",
-                                               reply_markup=keyboard)
+                await state.update_data(exchange=res['exchange'])
+                await state.set_state(PaymentStates.waiting_for_api_key)
+            await callback_query.message.edit_text(f"Подтверждено для {user_id}")
+        except TelegramForbiddenError:
+            await callback_query.message.edit_text(f"Подтверждено, но пользователь заблокировал бота")
+    else:
+        cursor.execute(
+            "UPDATE users SET subscription_type = %s, referral_uuid = NULL WHERE user_id = %s",
+            ("rejected", user_id)
+        )
+        conn.commit()
+        try:
+            await bot.send_message(
+                user_id,
+                "UUID отклонён. Выберите обычную подписку или попробуйте снова:",
+                reply_markup=get_subscription_type_keyboard()
+            )
+            await state.set_state(PaymentStates.waiting_for_subscription_type)
+            await callback_query.message.edit_text(f"Отклонено для {user_id}")
+        except TelegramForbiddenError:
+            await callback_query.message.edit_text(f"Отклонено, пользователь заблокировал бота")
 
-
-# ------------------- Обработчики для API подключения -------------------
 @router.message(F.text == "Подключить API")
 async def connect_api(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    current_state = await state.get_state()
-    logging.info(f"Processing 'Подключить API' for user {user_id}, current state: {current_state}")
+    cursor.execute("SELECT subscription_type, subscription_end, api_key, exchange FROM users WHERE user_id = %s", (user_id,))
+    res = cursor.fetchone()
 
-    cursor.execute("SELECT subscription_type, subscription_end, api_key FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-
-    if result and result['subscription_type'] == "referral_pending":
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer("⏳ Ваш UUID на модерации. Пожалуйста, дождитесь подтверждения.", reply_markup=keyboard)
-        return
-
-    if result and result['subscription_type'] == "referral_approved" and result[
-        'subscription_end'] > datetime.datetime.now():
-        if result['api_key']:
-            await message.answer(
-                "✅ У вас уже подключенна автоматизация. Вы можете проверить информацию о подписке или связаться с поддержкой для изменения ключей.",
-                reply_markup=get_main_menu(user_id)
-            )
-            await state.clear()
-            return
-        if current_state in [PaymentStates.waiting_for_api_key, PaymentStates.waiting_for_secret_key,
-                             PaymentStates.waiting_for_passphrase]:
-            if current_state == PaymentStates.waiting_for_api_key:
-                await message.answer('''
-Для того, чтобы успешно провести автоматизацию, вам нужно будет прислать api ключ и secret key с вашей биржи. 
-ВАЖНО!
-Мы не используем ваши данные в личных целях и не передаем их третьим лицам! Все данные хранятся в защищенной базе данных, мы используем их только для того, чтобы иметь возможность прямого запроса команд на биржу.
-Пожалуйста, напишите ваш API ключ:
-''')
-            elif current_state == PaymentStates.waiting_for_secret_key:
-                await message.answer("Пожалуйста, введите ваш Secret Key:")
-            elif current_state == PaymentStates.waiting_for_passphrase:
-                await message.answer("Пожалуйста, введите ваш Passphrase:")
-            return
-        await state.clear()
-        await message.answer("Выберите биржу:", reply_markup=get_exchange_keyboard())
-        await state.set_state(PaymentStates.waiting_for_api_key)
-    else:
+    if not res or not res['subscription_end'] or res['subscription_end'] <= datetime.datetime.now():
         await message.answer(
-            "❗️ У вас нет активной подписки для подключения автоматизации. Пожалуйста, выберите тип подписки:",
+            "Нет активной подписки. Выберите тип:",
             reply_markup=get_subscription_type_keyboard()
         )
         await state.set_state(PaymentStates.waiting_for_subscription_type)
-
-
-@router.message(F.text == "Информация о подписке")
-async def subscription_info(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    current_state = await state.get_state()
-    logging.info(f"Processing 'Информация о подписке' for user {user_id}, current state: {current_state}")
-
-    cursor.execute("SELECT subscription_end, subscription_type, api_key, exchange FROM users WHERE user_id = %s",
-                   (user_id,))
-    result = cursor.fetchone()
-
-    if result and result['subscription_type'] == "referral_pending":
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer("⏳ Ваш UUID на модерации. Пожалуйста, дождитесь подтверждения.", reply_markup=keyboard)
         return
 
-    if result and result['subscription_type'] == "referral_approved" and result['subscription_end'] is not None and \
-            result['subscription_end'] > datetime.datetime.now():
-        subscription_end = result['subscription_end']
-        subscription_type = result['subscription_type']
-        api_status = "Подключен" if result['api_key'] else "Не подключен"
-        exchange = result['exchange'] or "Не выбрана"
-        await message.answer(
-            f"📋 Информация о подписке:\n"
-            f"Тип подписки: Реферальная (подтверждена)\n"
-            f"Активна до: {subscription_end.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Биржа: {exchange}\n"
-            f"API: {api_status}",
-            parse_mode="HTML",
-            reply_markup=get_main_menu(user_id)
-        )
+    if res['api_key']:
+        await message.answer("API уже подключён.", reply_markup=get_main_menu(user_id))
         await state.clear()
+        return
+
+    # === ДЛЯ ОБЫЧНОЙ ПОДПИСКИ (regular) ===
+    if res['subscription_type'] == "regular":
+        # Если биржа уже выбрана — продолжаем
+        if res['exchange']:
+            await message.answer(
+                f"Биржа уже выбрана: {res['exchange'].upper()}\n"
+                "Введите ваш API-ключ:",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+            await state.update_data(exchange=res['exchange'])
+            await state.set_state(PaymentStates.waiting_for_api_key)
+        else:
+            # Просим выбрать биржу
+            await message.answer("Выберите биржу для подключения API:", reply_markup=get_exchange_keyboard())
+            await state.set_state(PaymentStates.waiting_for_api_key)
+
+    # === ДЛЯ РЕФЕРАЛЬНОЙ (referral_approved) ===
+    elif res['subscription_type'] == "referral_approved":
+        if res['exchange']:
+            await message.answer(
+                f"Реферальная подписка. Биржа: {res['exchange'].upper()}\n"
+                "Введите API-ключ:",
+                reply_markup=types.ReplyKeyboardRemove()
+            )
+            await state.update_data(exchange=res['exchange'])
+            await state.set_state(PaymentStates.waiting_for_api_key)
+        else:
+            await message.answer("Выберите биржу:", reply_markup=get_exchange_keyboard())
+            await state.set_state(PaymentStates.waiting_for_api_key)
+
     else:
-        await message.answer(
-            "❗️ У вас нет активной подписки.",
-            reply_markup=get_main_menu(user_id)
-        )
-        await state.set_state(PaymentStates.waiting_for_subscription_type)
+        await message.answer("Подписка не подтверждена. Дождитесь модерации.")
 
+@router.message(F.text == "Информация о подписке")
+async def subscription_info(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute(
+        "SELECT subscription_end, subscription_type, api_key, exchange FROM users WHERE user_id = %s",
+        (user_id,)
+    )
+    res = cursor.fetchone()
 
-@router.message(F.text == "📞 Поддержка")
-async def contact_support(message: types.Message, state: FSMContext):
+    if not res or not res['subscription_end'] or res['subscription_end'] <= datetime.datetime.now():
+        await message.answer("Нет активной подписки.", reply_markup=get_main_menu(user_id))
+        return
+
+    # Определяем тип подписки
+    sub_type = res['subscription_type']
+    if sub_type == "regular":
+        sub_name = "Обычная (оплачена)"
+    elif sub_type == "referral_approved":
+        sub_name = "Реферальная (подтверждена)"
+    elif sub_type == "referral_pending":
+        sub_name = "Реферальная (на модерации)"
+    else:
+        sub_name = sub_type.capitalize()
+
+    # Формируем текст
+    end_date = res['subscription_end'].strftime('%d.%m.%Y %H:%M')
+    api_status = "Подключён" if res['api_key'] else "Не подключён"
+    exchange_name = res['exchange'].upper() if res['exchange'] else "Не выбрана"
+
     await message.answer(
-        f"📞 Свяжитесь с поддержкой: {SUPPORT_CONTACT}",
-        reply_markup=get_main_menu(message.from_user.id)
+        f"**Информация о подписке**\n\n"
+        f"**Тип:** {sub_name}\n"
+        f"**Активна до:** {end_date}\n"
+        f"**Биржа:** {exchange_name}\n"
+        f"**API:** {api_status}",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu(user_id)
     )
 
+@router.message(F.text == "Поддержка")
+async def contact_support(message: types.Message):
+    await message.answer(f"Поддержка: {SUPPORT_CONTACT}", reply_markup=get_main_menu(message.from_user.id))
 
 @router.message(PaymentStates.waiting_for_api_key)
 async def process_api_key(message: types.Message, state: FSMContext):
     api_key = message.text.strip()
-    user_id = message.from_user.id
+    if len(api_key) < 10:
+        await message.answer("API-ключ слишком короткий.")
+        return
+
     data = await state.get_data()
     exchange = data.get('exchange')
 
     if not exchange:
-        logging.error(f"No exchange selected for user {user_id}")
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer("Ошибка: биржа не выбрана. Пожалуйста, выберите биржу:",
-                             reply_markup=get_exchange_keyboard())
+        await message.answer("Ошибка: биржа не выбрана. Нажмите 'Подключить API' заново.")
+        await state.clear()
         return
 
-    if len(api_key) < 10:
-        logging.warning(f"Invalid API key length for user {user_id}: {api_key}")
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer("❌ Неверный формат API-ключа. Пожалуйста, введите корректный API-ключ:",
-                             reply_markup=keyboard)
-        return
-
-    logging.info(f"API key received for user {user_id}: {api_key}")
     await state.update_data(api_key=api_key)
-    await message.answer("Введите ваш Secret Key:")
+    await message.answer("Введите Secret Key:")
     await state.set_state(PaymentStates.waiting_for_secret_key)
-
 
 @router.message(PaymentStates.waiting_for_secret_key)
 async def process_secret_key(message: types.Message, state: FSMContext):
     secret_key = message.text.strip()
-    data = await state.get_data()
-    user_id = message.from_user.id
-    exchange = data.get('exchange')
-    api_key = data.get('api_key')
-
     if len(secret_key) < 10:
-        logging.warning(f"Invalid Secret Key length for user {user_id}: {secret_key}")
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer("❌ Неверный формат Secret Key. Пожалуйста, введите корректный Secret Key:",
-                             reply_markup=keyboard)
+        await message.answer("Secret Key слишком короткий.")
         return
 
-    logging.info(f"Secret key received for user {user_id}: {secret_key}")
+    data = await state.get_data()
+    exchange = data['exchange']
+    api_key = data['api_key']
+
     await state.update_data(secret_key=secret_key)
 
     if exchange == 'okx':
-        await message.answer("Введите ваш Passphrase:")
+        await message.answer("Введите Passphrase:")
         await state.set_state(PaymentStates.waiting_for_passphrase)
     else:
+        # BingX — сохраняем сразу
         cursor.execute(
-            "UPDATE users SET api_key = %s, secret_key = %s, passphrase = NULL, exchange = %s, chat_id = %s WHERE user_id = %s",
-            (api_key, secret_key, exchange, user_id, user_id)
+            "UPDATE users SET api_key = %s, secret_key = %s, exchange = %s WHERE user_id = %s",
+            (api_key, secret_key, exchange, message.from_user.id)
         )
         conn.commit()
-        await message.answer(
-            "✅ Вы успешно подключили автоторговлю!",
-            reply_markup=get_main_menu(user_id)
-        )
+        await message.answer("API подключён!", reply_markup=get_main_menu(message.from_user.id))
         await state.clear()
-        logging.info(f"API keys successfully saved for user {user_id}, exchange: {exchange}")
-
 
 @router.message(PaymentStates.waiting_for_passphrase)
 async def process_passphrase(message: types.Message, state: FSMContext):
     passphrase = message.text.strip()
-    data = await state.get_data()
-    user_id = message.from_user.id
-    exchange = data.get('exchange')
-    api_key = data.get('api_key')
-    secret_key = data.get('secret_key')
-
     if len(passphrase) < 8:
-        logging.warning(f"Invalid Passphrase length for user {user_id}: {passphrase}")
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer(
-            "❌ Неверный формат Passphrase. Пожалуйста, введите корректный Passphrase (минимум 8 символов):",
-            reply_markup=keyboard
-        )
+        await message.answer("Passphrase слишком короткий (мин. 8).")
         return
-
-    logging.info(f"Passphrase received for user {user_id}: {passphrase}")
+    data = await state.get_data()
     cursor.execute(
-        "UPDATE users SET api_key = %s, secret_key = %s, passphrase = %s, exchange = %s, chat_id = %s WHERE user_id = %s",
-        (api_key, secret_key, passphrase, exchange, user_id, user_id)
+        """UPDATE users SET api_key = %s, secret_key = %s, passphrase = %s, exchange = %s, chat_id = %s
+           WHERE user_id = %s""",
+        (data['api_key'], data['secret_key'], passphrase, data['exchange'], message.from_user.id, message.from_user.id)
     )
     conn.commit()
-
-    await message.answer(
-        "✅ API-ключ и Passphrase успешно добавлены! Автоматизация подключена.",
-        reply_markup=get_main_menu(user_id)
-    )
+    await message.answer("API и Passphrase сохранены!", reply_markup=get_main_menu(message.from_user.id))
     await state.clear()
-    logging.info(f"API keys and passphrase successfully saved for user {user_id}, exchange: {exchange}")
-
 
 @router.callback_query(F.data == "cancel")
 async def cancel_action(callback_query: types.CallbackQuery, state: FSMContext):
@@ -936,135 +731,49 @@ async def cancel_action(callback_query: types.CallbackQuery, state: FSMContext):
     )
     await state.clear()
 
-
-@router.message(lambda message: message.text not in ["Подключить API", "Информация о подписке", "📞 Поддержка"])
-async def handle_invalid_input(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    current_state = await state.get_state()
-    logging.info(f"Invalid input from user {user_id}, state: {current_state}, input: {message.text}")
-
-    cursor.execute("SELECT subscription_type, subscription_end FROM users WHERE user_id = %s", (user_id,))
-    result = cursor.fetchone()
-
-    if current_state == PaymentStates.waiting_for_api_key:
+@router.message(lambda m: m.text not in ["Подключить API", "Информация о подписке", "Поддержка"])
+async def handle_invalid(message: types.Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur == PaymentStates.waiting_for_api_key:
         await process_api_key(message, state)
-        return
-    elif current_state == PaymentStates.waiting_for_secret_key:
+    elif cur == PaymentStates.waiting_for_secret_key:
         await process_secret_key(message, state)
-        return
-    elif current_state == PaymentStates.waiting_for_passphrase:
+    elif cur == PaymentStates.waiting_for_passphrase:
         await process_passphrase(message, state)
-        return
-    elif current_state == PaymentStates.waiting_for_referral_uuid:
+    elif cur == PaymentStates.waiting_for_referral_uuid:
         await process_referral_uuid(message, state)
-        return
-    elif result and result['subscription_type'] == "referral_approved" and result[
-        'subscription_end'] > datetime.datetime.now():
-        await message.answer(
-            "✅ У вас есть активная подписка. Выберите действие:",
-            reply_markup=get_main_menu(user_id)
-        )
-        await state.clear()
     else:
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-        await message.answer(
-            "❗️ Пожалуйста, используйте кнопки меню для взаимодействия с ботом.",
-            reply_markup=keyboard
-        )
+        await message.answer("Используйте кнопки меню.", reply_markup=get_main_menu(message.from_user.id))
         await state.clear()
-
 
 # ------------------- Фоновые задачи -------------------
-async def check_yoomoney_payments():
-    """Периодическая проверка статусов платежей YooMoney"""
-    while True:
-        try:
-            cursor.execute(
-                "SELECT yoomoney_label, user_id, tariff_id FROM payments WHERE payment_method = 'yoomoney' AND status = 'pending'"
-            )
-            pending_payments = cursor.fetchall()
-
-            for payment in pending_payments:
-                label = payment['yoomoney_label']
-                user_id = payment['user_id']
-                tariff_id = payment['tariff_id']
-
-                paid = check_yoomoney_payment(label)
-
-                if paid:
-                    tariff = TARIFFS.get(tariff_id)
-                    if tariff:
-                        subscription_end = datetime.datetime.now() + datetime.timedelta(days=tariff['days'])
-                        cursor.execute(
-                            "UPDATE users SET subscription_end = %s, subscription_type = %s WHERE user_id = %s",
-                            (subscription_end, "regular", user_id)
-                        )
-                        cursor.execute(
-                            "UPDATE payments SET status = %s WHERE yoomoney_label = %s",
-                            ("completed", label)
-                        )
-                        conn.commit()
-
-                        try:
-                            await bot.send_message(
-                                user_id,
-                                f"✅ Оплата подтверждена!\n"
-                                f"🔓 Подписка активна до <b>{subscription_end.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
-                                f"Теперь вы можете подключить API для автоматической торговли.",
-                                parse_mode="HTML",
-                                reply_markup=get_main_menu(user_id)
-                            )
-                        except TelegramBadRequest as e:
-                            logging.error(f"Failed to notify user {user_id} about payment: {e}")
-
-        except Exception as e:
-            logging.error(f"Error in check_yoomoney_payments: {e}")
-
-        await asyncio.sleep(30)
-
-
 async def check_subscriptions():
-    """Проверка истекших подписок"""
     while True:
         now = datetime.datetime.now()
         cursor.execute("SELECT user_id FROM users WHERE subscription_end < %s", (now,))
-        expired_users = cursor.fetchall()
-
-        for user in expired_users:
-            user_id = user['user_id']
+        for row in cursor.fetchall():
+            uid = row['user_id']
             try:
-                member = await bot.get_chat_member(chat_id=GROUP_ID, user_id=user_id)
+                member = await bot.get_chat_member(GROUP_ID, uid)
                 if member.status not in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED]:
-                    await bot.ban_chat_member(chat_id=GROUP_ID, user_id=user_id)
-                cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+                    await bot.ban_chat_member(GROUP_ID, uid)
+                cursor.execute("DELETE FROM users WHERE user_id = %s", (uid,))
                 conn.commit()
-                try:
-                    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-                        [types.InlineKeyboardButton(text="📞 Поддержка",
-                                                    url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-                    ])
-                    await bot.send_message(user_id, "Ваша подписка истекла. Пожалуйста, продлите её.",
-                                           reply_markup=keyboard)
-                except TelegramBadRequest as send_error:
-                    logging.warning(f"Could not send expiration message to user {user_id}: {send_error}")
+                await bot.send_message(uid, "Подписка истекла. Продлите её.")
             except TelegramForbiddenError:
-                logging.warning(f"Bot was blocked by user {user_id}. Removing from DB.")
-                cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM users WHERE user_id = %s", (uid,))
                 conn.commit()
-            except Exception as processing_error:
-                logging.error(f"Error processing expired subscription for user {user_id}: {processing_error}")
+            except Exception as e:
+                logging.error(f"Ошибка при обработке истёкшей подписки {uid}: {e}")
         await asyncio.sleep(3600)
 
+# (Фоновая проверка платежей больше не нужна – пользователь сам жмёт «Я оплатил»)
 
 # ------------------- Запуск -------------------
 async def main():
-    print("🤖 Бот VEXTR с YooMoney запущен...")
+    print("Бот запущен...")
     asyncio.create_task(check_subscriptions())
-    asyncio.create_task(check_yoomoney_payments())
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
