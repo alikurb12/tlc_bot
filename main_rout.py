@@ -1,4 +1,3 @@
-# main_rout.py
 import logging
 import uvicorn
 from fastapi import FastAPI, Request
@@ -7,7 +6,6 @@ from contextlib import asynccontextmanager
 from database import init_db, close_db
 from webhook import router
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -18,34 +16,65 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Базовая защита от сканеров
-BLOCKED_PATHS = [".git", ".env", "wp-admin", "phpmyadmin", "administrator", "backup", "sql"]
+BLOCKED_PATHS = [
+    # Статические файлы
+    "favicon.ico", "robots.txt", ".well-known", "sitemap.xml",
 
+    # Системные пути
+    ".git", ".env", ".htaccess", ".htpasswd",
+
+    # CMS и админки
+    "wp-admin", "wp-login", "phpmyadmin", "administrator",
+    "admin", "backend", "manager",
+
+    # Базы данных и бэкапы
+    "backup", "sql", "database", "dump",
+
+    # Docker и registry
+    "v2/_catalog", "api/v2/_catalog", "docker", "registry",
+
+    # Другие уязвимости
+    "cgi-bin", "shell", "cmd", "exec"
+]
 
 async def security_middleware(request: Request, call_next):
-    """Middleware для базовой безопасности"""
-    client_ip = request.client.host
-    path = request.url.path
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+    except Exception:
+        client_ip = "unknown"
 
-    # Блокируем опасные пути
+    path = request.url.path
+    method = request.method
+
     if any(blocked in path.lower() for blocked in BLOCKED_PATHS):
-        logger.warning(f"Блокирован сканер от {client_ip}: {path}")
+        logger.warning(f"Блокирован запрос от {client_ip}: {method} {path}")
         return JSONResponse(
             status_code=404,
             content={"status": "error", "message": "Not Found"}
         )
 
-    # Логируем только реальные запросы (не сканеры)
-    if path not in ["/", "/health"] and not path.startswith("/."):
-        logger.info(f"Запрос от {client_ip}: {request.method} {path}")
+    if method == "GET" and path not in ["/", "/health"]:
+        logger.warning(f"Блокирован GET запрос от {client_ip}: {path}")
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": "Not Found"}
+        )
 
-    response = await call_next(request)
-    return response
+    if method == "POST" and path == "/webhook":
+        logger.info(f"Webhook запрос от {client_ip}")
 
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        logger.error(f"Ошибка обработки запроса от {client_ip}: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Internal Server Error"}
+        )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Управление жизненным циклом приложения"""
     logger.info("Запуск универсального обработчика сигналов...")
     init_db()
     logger.info("База данных инициализирована")
@@ -55,8 +84,6 @@ async def lifespan(app: FastAPI):
         close_db()
         logger.info("Обработчик остановлен")
 
-
-# Создаем app с lifespan
 app = FastAPI(
     title="TLC Trading Bot API",
     description="API для обработки торговых сигналов",
@@ -64,11 +91,36 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Добавляем middleware к приложению
 app.middleware("http")(security_middleware)
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    client_ip = request.client.host if request.client else "unknown"
+    logger.error(f"Необработанное исключение от {client_ip}: {str(exc)}")
 
-# Добавляем корневой endpoint чтобы боты не получали 404
+    return JSONResponse(
+        status_code=500,
+        content={"status": "error", "message": "Internal Server Error"}
+    )
+
+
+@app.get("/favicon.ico")
+@app.get("/robots.txt")
+@app.get("/.well-known/{rest_of_path:path}")
+async def block_static_requests():
+    return JSONResponse(
+        status_code=404,
+        content={"status": "error", "message": "Not Found"}
+    )
+
+@app.get("/v2/{rest_of_path:path}")
+@app.get("/api/v2/{rest_of_path:path}")
+async def block_docker_requests():
+    return JSONResponse(
+        status_code=404,
+        content={"status": "error", "message": "Not Found"}
+    )
+
 @app.get("/")
 async def root():
     return {
@@ -76,15 +128,13 @@ async def root():
         "message": "TLC Trading Bot API is running",
         "endpoints": {
             "webhook": "POST /webhook",
-            "health": "GET /health",
-            "queue_status": "GET /queue/status"
+            "health": "GET /health"
         }
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     from datetime import datetime
     return {
         "status": "healthy",
@@ -93,7 +143,6 @@ async def health_check():
     }
 
 
-# Подключаем роутер webhook
 app.include_router(router)
 
 if __name__ == "__main__":
@@ -102,5 +151,7 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=5000,
-        log_config=None
+        log_config=None,
+        timeout_keep_alive=5,
+        limit_max_requests=1000,
     )
