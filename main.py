@@ -427,6 +427,13 @@ async def process_exchange(callback_query: types.CallbackQuery, state: FSMContex
     cursor.execute("SELECT subscription_type FROM users WHERE user_id = %s", (user_id,))
     res = cursor.fetchone()
 
+    if not res:
+        await callback_query.message.edit_text(
+            "Ошибка: пользователь не найден. Пройдите регистрацию заново.\nНажмите /start",
+            reply_markup=get_support_kb()
+        )
+        return
+
     if res['subscription_type'] == "regular":
         cursor.execute("UPDATE users SET exchange = %s WHERE user_id = %s", (exchange, user_id))
         conn.commit()
@@ -448,7 +455,7 @@ async def process_exchange(callback_query: types.CallbackQuery, state: FSMContex
         await state.update_data(exchange=exchange)
         await state.set_state(PaymentStates.waiting_for_referral_uuid)
     else:
-        await callback_query.answer("Ошибка доступа.", show_alert=True)
+        await callback_query.answer("Доступ запрещён.", show_alert=True)
 
 @router.message(PaymentStates.waiting_for_referral_uuid)
 async def process_referral_uuid(message: types.Message, state: FSMContext):
@@ -482,7 +489,11 @@ async def connect_api(message: types.Message, state: FSMContext):
     cursor.execute("SELECT subscription_type, subscription_end, api_key, exchange FROM users WHERE user_id = %s", (user_id,))
     res = cursor.fetchone()
 
-    if not res or not res['subscription_end'] or res['subscription_end'] <= datetime.datetime.now():
+    if not res:
+        await message.answer("Нет данных. Пройдите регистрацию: /start", reply_markup=get_support_kb())
+        return
+
+    if not res['subscription_end'] or res['subscription_end'] <= datetime.datetime.now():
         await message.answer("Нет активной подписки.", reply_markup=get_subscription_type_keyboard())
         await state.set_state(PaymentStates.waiting_for_subscription_type)
         return
@@ -514,7 +525,11 @@ async def subscription_info(message: types.Message):
     cursor.execute("SELECT subscription_end, subscription_type, api_key, exchange FROM users WHERE user_id = %s", (user_id,))
     res = cursor.fetchone()
 
-    if not res or not res['subscription_end'] or res['subscription_end'] <= datetime.datetime.now():
+    if not res:
+        await message.answer("Нет данных.", reply_markup=get_main_menu(user_id))
+        return
+
+    if not res['subscription_end'] or res['subscription_end'] <= datetime.datetime.now():
         await message.answer("Нет активной подписки.", reply_markup=get_main_menu(user_id))
         return
 
