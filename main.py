@@ -66,6 +66,7 @@ cursor.execute("""
         passphrase TEXT,
         exchange TEXT,
         email TEXT,
+        affirmate_username TEXT,
         terms_accepted BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
@@ -80,6 +81,7 @@ cursor.execute("""
         tariff_id TEXT,
         payment_method TEXT DEFAULT 'yoomoney',
         yoomoney_label TEXT,
+        affirmate_username TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
@@ -88,11 +90,23 @@ cursor.execute("""
 # Добавление недостающих полей
 for col, sql in [
     ("email", "ALTER TABLE users ADD COLUMN email TEXT;"),
+    ("affirmate_username", "ALTER TABLE users ADD COLUMN affirmate_username TEXT;"),
     ("terms_accepted", "ALTER TABLE users ADD COLUMN terms_accepted BOOLEAN DEFAULT FALSE;")
 ]:
     cursor.execute(f"""
         SELECT column_name FROM information_schema.columns 
         WHERE table_name = 'users' AND column_name = %s;
+    """, (col,))
+    if not cursor.fetchone():
+        cursor.execute(sql)
+        conn.commit()
+
+for col, sql in [
+    ("affirmate_username", "ALTER TABLE payments ADD COLUMN affirmate_username TEXT;")
+]:
+    cursor.execute(f"""
+        SELECT column_name FROM information_schema.columns 
+        WHERE table_name = 'payments' AND column_name = %s;
     """, (col,))
     if not cursor.fetchone():
         cursor.execute(sql)
@@ -114,6 +128,7 @@ class PaymentStates(StatesGroup):
     waiting_for_referral_uuid = State()
     waiting_for_payment = State()
     waiting_for_email = State()
+    waiting_for_promo = State()
     waiting_for_api_key = State()
     waiting_for_secret_key = State()
     waiting_for_passphrase = State()
@@ -204,6 +219,22 @@ VIDEO_INSTRUCTIONS = {
     'okx': 'videos/okx.mp4'
 }
 
+async def request_email(message_or_cb: types.Message | types.CallbackQuery, state: FSMContext):
+    user_id = message_or_cb.from_user.id
+    await bot.send_message(
+        user_id,
+        "Напишите ваш e-mail.\n"
+        "Отправляя e-mail, вы соглашаетесь с\n"
+        "<a href='https://www.vextr.ru/privacy'>Политикой конфиденциальности</a>\n"
+        "и <a href='https://www.vextr.ru/docs'>Политикой обработки персональных данных</a>",
+        parse_mode="HTML",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
+            [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+        ])
+    )
+    await state.set_state(PaymentStates.waiting_for_email)
+
 # ------------------- Обработчики -------------------
 @router.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -293,20 +324,70 @@ async def process_tariff_selection(callback_query: types.CallbackQuery, state: F
         return
 
     tariff = TARIFFS[tariff_id]
-    await state.update_data(tariff_id=tariff_id, tariff_name=tariff['name'], tariff_price=tariff['price'])
+    await state.update_data(
+        tariff_id=tariff_id,
+        tariff_name=tariff['name'],
+        tariff_price=tariff['price'],
+        discount=0,
+        final_price=tariff['price'],
+        affirmate_username=None
+    )
 
     await callback_query.message.edit_text(
-        "Напишите ваш e-mail.\n"
-        "Отправляя e-mail, вы соглашаетесь с\n"
-        "<a href='https://www.vextr.ru/privacy'>Политикой конфиденциальности</a>\n"
-        "и <a href='https://www.vextr.ru/docs'>Политикой обработки персональных данных</a>",
+        f"Тариф: <b>{tariff['name']} – {tariff['price']}₽</b>\n\n"
+        f"Есть промокод от партнёра?\n"
+        f"Введите его или нажмите «Пропустить»",
         parse_mode="HTML",
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="Пропустить", callback_data="skip_promo")],
             [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
             [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
         ])
     )
-    await state.set_state(PaymentStates.waiting_for_email)
+    await state.set_state(PaymentStates.waiting_for_promo)
+
+@router.message(PaymentStates.waiting_for_promo)
+async def process_promo(message: types.Message, state: FSMContext):
+    promo = message.text.strip().upper()
+    user_id = message.from_user.id
+
+    if len(promo) < 3:
+        await message.answer("Промокод слишком короткий.")
+        return
+
+    cursor.execute(
+        "SELECT username, status FROM affiliate_applications WHERE promo_code = %s",
+        (promo,)
+    )
+    res = cursor.fetchone()
+
+    if not res or res['status'] != 'approved':
+        await message.answer("Промокод неверный или неактивен.")
+        return
+
+    data = await state.get_data()
+    original_price = data['tariff_price']
+    discount_price = int(original_price * 0.8)
+
+    await state.update_data(
+        discount=20,
+        final_price=discount_price,
+        affirmate_username=res['username']
+    )
+
+    await message.answer(
+        f"Промокод применён!\n"
+        f"Скидка 20% от <b>@{res['username']}</b>\n"
+        f"К оплате: <b>{discount_price}₽</b>",
+        parse_mode="HTML"
+    )
+    await request_email(message, state)
+
+@router.callback_query(F.data == "skip_promo")
+async def skip_promo(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.message.delete()
+    await bot.send_message(callback_query.from_user.id, "Промокод пропущен.")
+    await request_email(callback_query.message, state)
 
 @router.message(PaymentStates.waiting_for_email)
 async def process_email(message: types.Message, state: FSMContext):
@@ -318,30 +399,32 @@ async def process_email(message: types.Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    tariff_id = data['tariff_id']
-    tariff = TARIFFS[tariff_id]
-    description = f"Подписка {tariff['name']}"
+    tariff = TARIFFS[data['tariff_id']]
+    final_price = data.get('final_price', tariff['price'])
+    affirmate = data.get('affirmate_username')
+    description = f"Подписка {tariff['name']}" + (f" (промокод @{affirmate})" if affirmate else "")
 
     cursor.execute(
-        "INSERT INTO users (user_id, email) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET email = %s",
-        (user_id, email, email)
+        "INSERT INTO users (user_id, email, affirmate_username) VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET email = %s, affirmate_username = COALESCE(EXCLUDED.affirmate_username, users.affirmate_username)",
+        (user_id, email, affirmate, email)
     )
     conn.commit()
 
-    payment = create_yoomoney_payment(user_id, tariff['price'], description)
+    payment = create_yoomoney_payment(user_id, final_price, description)
     if payment["status"] != "success":
         await message.answer("Ошибка создания платежа.", reply_markup=get_support_kb())
         return
 
     invoice_id = f"yoomoney_{payment['label']}"
     cursor.execute(
-        "INSERT INTO payments (invoice_id, user_id, amount, currency, status, tariff_id, payment_method, yoomoney_label) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (invoice_id, user_id, tariff['price'], "RUB", "pending", tariff_id, "yoomoney", payment['label'])
+        "INSERT INTO payments (invoice_id, user_id, amount, currency, status, tariff_id, payment_method, yoomoney_label, affirmate_username) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (invoice_id, user_id, final_price, "RUB", "pending", data['tariff_id'], "yoomoney", payment['label'], affirmate)
     )
     conn.commit()
 
-    await state.update_data(yoomoney_label=payment['label'], invoice_id=invoice_id, email=email)
+    await state.update_data(yoomoney_label=payment['label'], invoice_id=invoice_id, email=email, final_price=final_price)
 
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="Оплатить", url=payment["pay_url"])],
@@ -350,8 +433,9 @@ async def process_email(message: types.Message, state: FSMContext):
         [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
     ])
 
+    discount_text = f"\nСкидка 20%: <b>-{int(tariff['price'] - final_price)}₽</b>" if data.get('discount', 0) > 0 else ""
     await message.answer(
-        f"Оплатите <b>{tariff['price']}₽</b> за <b>{tariff['name']}</b>\n"
+        f"Оплатите <b>{final_price}₽</b> за <b>{tariff['name']}</b>{discount_text}\n"
         f"Email: <code>{email}</code>\n\n"
         f"<a href='{payment['pay_url']}'>Ссылка для оплаты</a>\n\n"
         f"После оплаты нажмите кнопку ниже",
@@ -367,7 +451,7 @@ async def check_payment_callback(callback_query: types.CallbackQuery, state: FSM
     await callback_query.answer("Проверяем…")
 
     if check_yoomoney_payment(label):
-        cursor.execute("SELECT tariff_id FROM payments WHERE yoomoney_label = %s", (label,))
+        cursor.execute("SELECT tariff_id, amount, affirmate_username FROM payments WHERE yoomoney_label = %s", (label,))
         payment = cursor.fetchone()
         if not payment:
             await callback_query.message.edit_text("Платёж не найден.")
@@ -388,7 +472,9 @@ async def check_payment_callback(callback_query: types.CallbackQuery, state: FSM
 
         data = await state.get_data()
         email = data.get('email', 'Не указан')
-        tariff_name = data.get('tariff_name', tariff['name'])
+        final_price = payment['amount']
+        affirmate = payment['affirmate_username']
+        affirmate_text = f"\nПромокод от: <b>@{affirmate}</b>" if affirmate else ""
 
         try:
             await bot.send_message(
@@ -396,7 +482,8 @@ async def check_payment_callback(callback_query: types.CallbackQuery, state: FSM
                 f"ОПЛАТА ПОДТВЕРЖДЕНА\n\n"
                 f"Пользователь: <a href='tg://user?id={user_id}'>{user_id}</a>\n"
                 f"Email: <code>{email}</code>\n"
-                f"Тариф: <b>{tariff_name}</b> ({tariff['price']}₽)\n"
+                f"Тариф: <b>{tariff['name']}</b> ({final_price}₽)\n"
+                f"{affirmate_text}\n"
                 f"Активна до: <b>{end.strftime('%d.%m.%Y %H:%M')}</b>",
                 parse_mode="HTML"
             )
