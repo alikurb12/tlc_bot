@@ -116,7 +116,7 @@ conn.commit()
 
 # ------------------- Тарифы -------------------
 TARIFFS = {
-    '1month': {'days': 30, 'price': 500, 'name': '1 месяц', 'currency': 'RUB'},
+    '1month': {'days': 30, 'price': 5, 'name': '1 месяц', 'currency': 'RUB'},
     '3months': {'days': 90, 'price': 1200, 'name': '3 месяца', 'currency': 'RUB'},
 }
 
@@ -303,7 +303,6 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
         await callback_query.message.edit_text("Выберите биржу для реферала:", reply_markup=get_exchange_keyboard())
         await state.update_data(subscription_type="referral_pending")
 
-        # ← СОХРАНЯЕМ В БД
         cursor.execute(
             "INSERT INTO users (user_id, subscription_type) VALUES (%s, %s) "
             "ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s",
@@ -338,7 +337,6 @@ async def process_tariff_selection(callback_query: types.CallbackQuery, state: F
         tariff_id=tariff_id,
         tariff_name=tariff['name'],
         tariff_price=tariff['price'],
-        discount=0,
         final_price=tariff['price'],
         affirmate_username=None
     )
@@ -376,19 +374,17 @@ async def process_promo(message: types.Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    original_price = data['tariff_price']
-    discount_price = int(original_price * 0.8)
+    final_price = data['tariff_price']  # ← БЕЗ СКИДКИ
 
     await state.update_data(
-        discount=20,
-        final_price=discount_price,
+        final_price=final_price,
         affirmate_username=res['username']
     )
 
     await message.answer(
-        f"Промокод применён!\n"
-        f"Скидка 20% от <b>@{res['username']}</b>\n"
-        f"К оплате: <b>{discount_price}₽</b>",
+        f"Промокод принят!\n"
+        f"От партнёра: <b>@{res['username']}</b>\n"
+        f"К оплате: <b>{final_price}₽</b>",
         parse_mode="HTML"
     )
     await request_email(message, state)
@@ -410,7 +406,7 @@ async def process_email(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     tariff = TARIFFS[data['tariff_id']]
-    final_price = data.get('final_price', tariff['price'])
+    final_price = tariff['price']  # ← ВСЕГДА ПОЛНАЯ ЦЕНА
     affirmate = data.get('affirmate_username')
     description = f"Подписка {tariff['name']}" + (f" (промокод @{affirmate})" if affirmate else "")
 
@@ -443,9 +439,8 @@ async def process_email(message: types.Message, state: FSMContext):
         [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
     ])
 
-    discount_text = f"\nСкидка 20%: <b>-{int(tariff['price'] - final_price)}₽</b>" if data.get('discount', 0) > 0 else ""
     await message.answer(
-        f"Оплатите <b>{final_price}₽</b> за <b>{tariff['name']}</b>{discount_text}\n"
+        f"Оплатите <b>{final_price}₽</b> за <b>{tariff['name']}</b>\n"
         f"Email: <code>{email}</code>\n\n"
         f"<a href='{payment['pay_url']}'>Ссылка для оплаты</a>\n\n"
         f"После оплаты нажмите кнопку ниже",
@@ -458,7 +453,7 @@ async def process_email(message: types.Message, state: FSMContext):
 async def check_payment_callback(callback_query: types.CallbackQuery, state: FSMContext):
     label = callback_query.data.split(":")[1]
     user_id = callback_query.from_user.id
-    await callback_query.answercade("Проверяем…")
+    await callback_query.answer("Проверяем…")  # ← ИСПРАВЛЕНО
 
     if check_yoomoney_payment(label):
         cursor.execute("SELECT tariff_id, amount, affirmate_username FROM payments WHERE yoomoney_label = %s", (label,))
@@ -597,15 +592,14 @@ async def approve_referral(callback_query: types.CallbackQuery):
     conn.commit()
 
     try:
-        await bot.send_message(user_id, "Ваша реферальная подписка одобрена!\nПодписка активна.\nТеперь подключите API.", reply_markup=get_main_menu(user_id))
+        await bot.send_message(user_id, "Ваша реферальная подписка одобрена!\nПодписка активна 1 год.\nТеперь подключите API.", reply_markup=get_main_menu(user_id))
     except Exception as e:
         logging.error(f"Не удалось отправить пользователю {user_id}: {e}")
 
     await callback_query.message.edit_text(
-        f"Реферал {user_id} — ОДОБРЕН\nПодписка на активирована.",
+        f"Реферал {user_id} — ОДОБРЕН\nПодписка на 1 год активирована.",
         reply_markup=None
     )
-
 
 @router.callback_query(F.data.startswith("reject_uuid:"))
 async def reject_referral(callback_query: types.CallbackQuery):
@@ -735,7 +729,7 @@ async def process_secret_key(message: types.Message, state: FSMContext):
             (api_key, secret, exchange, message.from_user.id)
         )
         conn.commit()
-        await message.answer("Автоторговля подключена!", reply_markup=get_main_menu(message.from_user.id))
+        await message.answer("API подключён!", reply_markup=get_main_menu(message.from_user.id))
         await state.clear()
 
 @router.message(PaymentStates.waiting_for_passphrase)
