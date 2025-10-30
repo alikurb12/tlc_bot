@@ -299,8 +299,18 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
             await callback_query.message.edit_text("Реферальная подписка активна.\nВыберите биржу:", reply_markup=get_exchange_keyboard())
             await state.set_state(PaymentStates.waiting_for_api_key)
             return
+
         await callback_query.message.edit_text("Выберите биржу для реферала:", reply_markup=get_exchange_keyboard())
-        await state.update_data(subscription_type="referral")
+        await state.update_data(subscription_type="referral_pending")
+
+        # ← СОХРАНЯЕМ В БД
+        cursor.execute(
+            "INSERT INTO users (user_id, subscription_type) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s",
+            (user_id, "referral_pending", "referral_pending")
+        )
+        conn.commit()
+
         await state.set_state(PaymentStates.waiting_for_exchange)
     else:
         cursor.execute(
@@ -356,7 +366,7 @@ async def process_promo(message: types.Message, state: FSMContext):
         return
 
     cursor.execute(
-        "SELECT username, status FROM affiliate_applications WHERE promo_code = %s",
+        "SELECT username, status FROM affiliate_applications WHERE UPPER(promo_code) = %s",
         (promo,)
     )
     res = cursor.fetchone()
@@ -448,7 +458,7 @@ async def process_email(message: types.Message, state: FSMContext):
 async def check_payment_callback(callback_query: types.CallbackQuery, state: FSMContext):
     label = callback_query.data.split(":")[1]
     user_id = callback_query.from_user.id
-    await callback_query.answer("Проверяем…")
+    await callback_query.answercade("Проверяем…")
 
     if check_yoomoney_payment(label):
         cursor.execute("SELECT tariff_id, amount, affirmate_username FROM payments WHERE yoomoney_label = %s", (label,))
@@ -524,23 +534,28 @@ async def process_exchange(callback_query: types.CallbackQuery, state: FSMContex
     if res['subscription_type'] == "regular":
         cursor.execute("UPDATE users SET exchange = %s WHERE user_id = %s", (exchange, user_id))
         conn.commit()
-
         await callback_query.message.edit_text(f"Биржа {exchange.upper()} выбрана.\n\nВведите ваш API-ключ:")
         await bot.send_message(user_id, "Введите ваш API-ключ:", reply_markup=types.ReplyKeyboardRemove())
         await state.update_data(exchange=exchange)
         await state.set_state(PaymentStates.waiting_for_api_key)
 
-    elif res['subscription_type'] == "referral_approved":
-        video_path = VIDEO_INSTRUCTIONS.get(exchange)
-        if not video_path or not os.path.exists(video_path):
-            await callback_query.message.edit_text("Видео недоступно.", reply_markup=get_support_kb())
-            return
-        await bot.send_video(user_id, types.FSInputFile(video_path), caption=f"Инструкция для {exchange.upper()}")
-        await bot.send_message(user_id, "Введите UUID:", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")]
-        ]))
-        await state.update_data(exchange=exchange)
-        await state.set_state(PaymentStates.waiting_for_referral_uuid)
+    elif res['subscription_type'] in ["referral_pending", "referral_approved"]:
+        if res['subscription_type'] == "referral_approved":
+            await callback_query.message.edit_text(f"Биржа {exchange.upper()} выбрана.\n\nВведите ваш API-ключ:")
+            await bot.send_message(user_id, "Введите ваш API-ключ:", reply_markup=types.ReplyKeyboardRemove())
+            await state.update_data(exchange=exchange)
+            await state.set_state(PaymentStates.waiting_for_api_key)
+        else:
+            video_path = VIDEO_INSTRUCTIONS.get(exchange)
+            if not video_path or not os.path.exists(video_path):
+                await callback_query.message.edit_text("Видео недоступно.", reply_markup=get_support_kb())
+                return
+            await bot.send_video(user_id, types.FSInputFile(video_path), caption=f"Инструкция для {exchange.upper()}")
+            await bot.send_message(user_id, "Введите UUID:", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")]
+            ]))
+            await state.update_data(exchange=exchange)
+            await state.set_state(PaymentStates.waiting_for_referral_uuid)
     else:
         await callback_query.answer("Доступ запрещён.", show_alert=True)
 
@@ -568,6 +583,50 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
     )
     await message.answer("UUID отправлен. Ожидайте.")
     await state.clear()
+
+# ------------------- Модерация рефералов -------------------
+@router.callback_query(F.data.startswith("approve_uuid:"))
+async def approve_referral(callback_query: types.CallbackQuery):
+    user_id = int(callback_query.data.split(":")[1])
+    await callback_query.answer()
+
+    cursor.execute(
+        "UPDATE users SET subscription_type = 'referral_approved', subscription_end = NOW() + INTERVAL '365 days' WHERE user_id = %s",
+        (user_id,)
+    )
+    conn.commit()
+
+    try:
+        await bot.send_message(user_id, "Ваша реферальная подписка одобрена!\nПодписка активна.\nТеперь подключите API.", reply_markup=get_main_menu(user_id))
+    except Exception as e:
+        logging.error(f"Не удалось отправить пользователю {user_id}: {e}")
+
+    await callback_query.message.edit_text(
+        f"Реферал {user_id} — ОДОБРЕН\nПодписка на активирована.",
+        reply_markup=None
+    )
+
+
+@router.callback_query(F.data.startswith("reject_uuid:"))
+async def reject_referral(callback_query: types.CallbackQuery):
+    user_id = int(callback_query.data.split(":")[1])
+    await callback_query.answer()
+
+    cursor.execute(
+        "UPDATE users SET subscription_type = NULL, referral_uuid = NULL WHERE user_id = %s",
+        (user_id,)
+    )
+    conn.commit()
+
+    try:
+        await bot.send_message(user_id, "Ваша заявка на реферальную подписку отклонена.", reply_markup=get_main_menu(user_id))
+    except Exception as e:
+        logging.error(f"Не удалось отправить пользователю {user_id}: {e}")
+
+    await callback_query.message.edit_text(
+        f"Реферал {user_id} — ОТКЛОНЁН",
+        reply_markup=None
+    )
 
 # ------------------- Подключение API -------------------
 @router.message(F.text == "Подключить API")
@@ -676,7 +735,7 @@ async def process_secret_key(message: types.Message, state: FSMContext):
             (api_key, secret, exchange, message.from_user.id)
         )
         conn.commit()
-        await message.answer("API подключён!", reply_markup=get_main_menu(message.from_user.id))
+        await message.answer("Автоторговля подключена!", reply_markup=get_main_menu(message.from_user.id))
         await state.clear()
 
 @router.message(PaymentStates.waiting_for_passphrase)
