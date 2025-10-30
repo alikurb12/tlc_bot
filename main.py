@@ -318,10 +318,57 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
             (user_id, user_id, "regular", user_id, "regular")
         )
         conn.commit()
-        await callback_query.message.edit_text("Выберите тариф:", reply_markup=get_tariffs_keyboard())
+        await callback_query.message.edit_text("Выберите биржу:", reply_markup=get_exchange_keyboard())
         await state.update_data(subscription_type="regular")
+        await state.set_state(PaymentStates.waiting_for_exchange)
+
+# ------------------- Выбор биржи (ВИДЕО ДЛЯ ВСЕХ) -------------------
+@router.callback_query(F.data.startswith("exchange:"))
+async def process_exchange(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    exchange = callback_query.data.split(":")[1]
+
+    cursor.execute("SELECT subscription_type, subscription_end FROM users WHERE user_id = %s", (user_id,))
+    res = cursor.fetchone()
+
+    if not res:
+        await callback_query.message.edit_text(
+            "Ошибка: пользователь не найден. Пройдите регистрацию заново.\nНажмите /start",
+            reply_markup=get_support_kb()
+        )
+        return
+
+    # ← ВИДЕО ДЛЯ ВСЕХ
+    video_path = VIDEO_INSTRUCTIONS.get(exchange)
+    if video_path and os.path.exists(video_path):
+        try:
+            await bot.send_video(user_id, types.FSInputFile(video_path), caption=f"Инструкция по подключению {exchange.upper()}")
+        except Exception as e:
+            logging.error(f"Ошибка отправки видео: {e}")
+
+    # ← Сохраняем биржу
+    cursor.execute("UPDATE users SET exchange = %s WHERE user_id = %s", (exchange, user_id))
+    conn.commit()
+
+    # ← Если подписка уже активна — сразу API
+    if res['subscription_end'] and res['subscription_end'] > datetime.datetime.now():
+        await callback_query.message.edit_text(f"Биржа {exchange.upper()} выбрана.\n\nВведите ваш API-ключ:")
+        await bot.send_message(user_id, "Введите ваш API-ключ:", reply_markup=types.ReplyKeyboardRemove())
+        await state.update_data(exchange=exchange)
+        await state.set_state(PaymentStates.waiting_for_api_key)
+        return
+
+    # ← Если реферальный — ждём UUID
+    if res['subscription_type'] == "referral_pending":
+        await callback_query.message.edit_text("Видео отправлено.\n\nВведите UUID:")
+        await state.update_data(exchange=exchange)
+        await state.set_state(PaymentStates.waiting_for_referral_uuid)
+    else:
+        await callback_query.message.edit_text("Видео отправлено.\n\nВыберите тариф:", reply_markup=get_tariffs_keyboard())
+        await state.update_data(exchange=exchange)
         await state.set_state(PaymentStates.waiting_for_payment)
 
+# ------------------- Выбор тарифа (промокод ТОЛЬКО для 1 месяца) -------------------
 @router.callback_query(F.data.startswith("tariff:"))
 async def process_tariff_selection(callback_query: types.CallbackQuery, state: FSMContext):
     tariff_id = callback_query.data.split(":")[1]
@@ -341,18 +388,21 @@ async def process_tariff_selection(callback_query: types.CallbackQuery, state: F
         affirmate_username=None
     )
 
-    await callback_query.message.edit_text(
-        f"Тариф: <b>{tariff['name']} – {tariff['price']}₽</b>\n\n"
-        f"Есть промокод от партнёра?\n"
-        f"Введите его или нажмите «Пропустить»",
-        parse_mode="HTML",
-        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="Пропустить", callback_data="skip_promo")],
-            [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
-            [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-    )
-    await state.set_state(PaymentStates.waiting_for_promo)
+    if tariff_id == '1month':
+        await callback_query.message.edit_text(
+            f"Тариф: <b>{tariff['name']} – {tariff['price']}₽</b>\n\n"
+            f"Есть промокод от партнёра?\n"
+            f"Введите его или нажмите «Пропустить»",
+            parse_mode="HTML",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="Пропустить", callback_data="skip_promo")],
+                [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
+                [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+            ])
+        )
+        await state.set_state(PaymentStates.waiting_for_promo)
+    else:
+        await request_email(callback_query, state)
 
 @router.message(PaymentStates.waiting_for_promo)
 async def process_promo(message: types.Message, state: FSMContext):
@@ -374,7 +424,7 @@ async def process_promo(message: types.Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    final_price = data['tariff_price']  # ← БЕЗ СКИДКИ
+    final_price = data['tariff_price']
 
     await state.update_data(
         final_price=final_price,
@@ -406,7 +456,7 @@ async def process_email(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     tariff = TARIFFS[data['tariff_id']]
-    final_price = tariff['price']  # ← ВСЕГДА ПОЛНАЯ ЦЕНА
+    final_price = tariff['price']
     affirmate = data.get('affirmate_username')
     description = f"Подписка {tariff['name']}" + (f" (промокод @{affirmate})" if affirmate else "")
 
@@ -453,7 +503,7 @@ async def process_email(message: types.Message, state: FSMContext):
 async def check_payment_callback(callback_query: types.CallbackQuery, state: FSMContext):
     label = callback_query.data.split(":")[1]
     user_id = callback_query.from_user.id
-    await callback_query.answer("Проверяем…")  # ← ИСПРАВЛЕНО
+    await callback_query.answer("Проверяем…")
 
     if check_yoomoney_payment(label):
         cursor.execute("SELECT tariff_id, amount, affirmate_username FROM payments WHERE yoomoney_label = %s", (label,))
@@ -509,50 +559,6 @@ async def check_payment_callback(callback_query: types.CallbackQuery, state: FSM
             [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
         ])
         await callback_query.message.edit_text("Платёж не подтверждён. Подождите и попробуйте снова.", reply_markup=kb)
-
-# ------------------- Реферальная система -------------------
-@router.callback_query(F.data.startswith("exchange:"))
-async def process_exchange(callback_query: types.CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-    exchange = callback_query.data.split(":")[1]
-
-    cursor.execute("SELECT subscription_type FROM users WHERE user_id = %s", (user_id,))
-    res = cursor.fetchone()
-
-    if not res:
-        await callback_query.message.edit_text(
-            "Ошибка: пользователь не найден. Пройдите регистрацию заново.\nНажмите /start",
-            reply_markup=get_support_kb()
-        )
-        return
-
-    if res['subscription_type'] == "regular":
-        cursor.execute("UPDATE users SET exchange = %s WHERE user_id = %s", (exchange, user_id))
-        conn.commit()
-        await callback_query.message.edit_text(f"Биржа {exchange.upper()} выбрана.\n\nВведите ваш API-ключ:")
-        await bot.send_message(user_id, "Введите ваш API-ключ:", reply_markup=types.ReplyKeyboardRemove())
-        await state.update_data(exchange=exchange)
-        await state.set_state(PaymentStates.waiting_for_api_key)
-
-    elif res['subscription_type'] in ["referral_pending", "referral_approved"]:
-        if res['subscription_type'] == "referral_approved":
-            await callback_query.message.edit_text(f"Биржа {exchange.upper()} выбрана.\n\nВведите ваш API-ключ:")
-            await bot.send_message(user_id, "Введите ваш API-ключ:", reply_markup=types.ReplyKeyboardRemove())
-            await state.update_data(exchange=exchange)
-            await state.set_state(PaymentStates.waiting_for_api_key)
-        else:
-            video_path = VIDEO_INSTRUCTIONS.get(exchange)
-            if not video_path or not os.path.exists(video_path):
-                await callback_query.message.edit_text("Видео недоступно.", reply_markup=get_support_kb())
-                return
-            await bot.send_video(user_id, types.FSInputFile(video_path), caption=f"Инструкция для {exchange.upper()}")
-            await bot.send_message(user_id, "Введите UUID:", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")]
-            ]))
-            await state.update_data(exchange=exchange)
-            await state.set_state(PaymentStates.waiting_for_referral_uuid)
-    else:
-        await callback_query.answer("Доступ запрещён.", show_alert=True)
 
 @router.message(PaymentStates.waiting_for_referral_uuid)
 async def process_referral_uuid(message: types.Message, state: FSMContext):
@@ -642,22 +648,12 @@ async def connect_api(message: types.Message, state: FSMContext):
         await message.answer("API уже подключён.", reply_markup=get_main_menu(user_id))
         return
 
-    if res['subscription_type'] == "regular":
-        if res['exchange']:
-            await message.answer(f"Биржа: {res['exchange'].upper()}\nВведите API-ключ:", reply_markup=types.ReplyKeyboardRemove())
-            await state.update_data(exchange=res['exchange'])
-        else:
-            await message.answer("Выберите биржу:", reply_markup=get_exchange_keyboard())
-        await state.set_state(PaymentStates.waiting_for_api_key)
-
-    elif res['subscription_type'] == "referral_approved":
-        if res['exchange']:
-            await message.answer("Введите API-ключ:", reply_markup=types.ReplyKeyboardRemove())
-            await state.update_data(exchange=res['exchange'])
-            await state.set_state(PaymentStates.waiting_for_api_key)
-        else:
-            await message.answer("Выберите биржу:", reply_markup=get_exchange_keyboard())
-            await state.set_state(PaymentStates.waiting_for_api_key)
+    if res['exchange']:
+        await message.answer(f"Биржа: {res['exchange'].upper()}\nВведите API-ключ:", reply_markup=types.ReplyKeyboardRemove())
+        await state.update_data(exchange=res['exchange'])
+    else:
+        await message.answer("Выберите биржу:", reply_markup=get_exchange_keyboard())
+    await state.set_state(PaymentStates.waiting_for_api_key)
 
 @router.message(F.text == "Информация о подписке")
 async def subscription_info(message: types.Message):
