@@ -6,7 +6,8 @@ from aiogram import types
 import os
 from typing import Dict, Optional
 from database import get_cursor, commit
-from main import bot, send_signal_notification
+from utils import send_signal_notification
+from main import bot
 from bingx_api import (
     get_balance as bingx_get_balance,
     set_leverage as bingx_set_leverage,
@@ -31,7 +32,7 @@ from okx_api import (
 logger = logging.getLogger(__name__)
 
 
-def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
+async def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
     user_id = user['user_id']
     api_key = user['api_key']
     secret_key = user['secret_key']
@@ -152,7 +153,7 @@ def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
         return False
 
 
-def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
+async def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
     user_id = user['user_id']
     api_key = user['api_key']
     secret_key = user['secret_key']
@@ -252,7 +253,7 @@ def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
         return False
 
 
-def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
+async def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     user_id = user['user_id']
     api_key = user['api_key']
     secret_key = user['secret_key']
@@ -377,7 +378,7 @@ def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         return None
 
 
-def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
+async def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     user_id = user['user_id']
     api_key = user['api_key']
     secret_key = user['secret_key']
@@ -479,7 +480,7 @@ def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
         return None
 
-def process_bingx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
+async def process_bingx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
     """Обработка MOVE_SL для BingX"""
     user_id = user['user_id']
     api_key = user['api_key']
@@ -514,7 +515,7 @@ def process_bingx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
         return None
 
 
-def process_okx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
+async def process_okx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
     """Обработка MOVE_SL для OKX"""
     user_id = user['user_id']
     api_key = user['api_key']
