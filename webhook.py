@@ -192,10 +192,10 @@ async def webhook(request: Request):
             try:
                 if exchange == 'bingx':
                     from services import process_bingx_signal
-                    result = process_bingx_signal(user, signal)
+                    result = await process_bingx_signal(user, signal)
                 elif exchange == 'okx':
                     from services import process_okx_signal
-                    result = process_okx_signal(user, signal)
+                    result = await process_okx_signal(user, signal)
                 else:
                     logger.error(f"Неизвестная биржа: {exchange} для пользователя {user_id}")
                     continue

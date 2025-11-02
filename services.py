@@ -267,7 +267,7 @@ async def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
 
     try:
         # Проверяем и закрываем противоположные открытые сделки
-        close_bingx_trade(user, symbol, action)
+        await close_bingx_trade(user, symbol, action)
 
         # Проверяем открытые позиции
         open_positions = bingx_get_open_positions(symbol, api_key, secret_key)
@@ -344,7 +344,7 @@ async def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
 
         try:
             loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(send_signal_notification(signal, user_id), loop)
+            await send_signal_notification(signal, user_id, bot)
             logger.info(f"Запущена отправка уведомления для пользователя {user_id}")
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления для user {user_id}: {notify_error}")
@@ -392,7 +392,7 @@ async def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
 
     try:
         # Проверяем и закрываем противоположные открытые сделки
-        close_okx_trade(user, symbol, action)
+        await close_okx_trade(user, symbol, action)
 
         usdt_balance = okx_get_balance(api_key, secret_key, passphrase)
 
@@ -443,7 +443,7 @@ async def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
 
         try:
             loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(send_signal_notification(signal, user_id), loop)
+            await send_signal_notification(signal, user_id, bot)
             logger.info(f"Запущена отправка уведомления для пользователя {user_id}")
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления для user {user_id}: {notify_error}")
