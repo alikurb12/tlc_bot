@@ -116,7 +116,7 @@ conn.commit()
 
 # ------------------- Тарифы -------------------
 TARIFFS = {
-    '1month': {'days': 30, 'price': 500, 'name': '1 месяц', 'currency': 'RUB'},
+    '1month': {'days': 30, 'price': 5, 'name': '1 месяц', 'currency': 'RUB'},
     '3months': {'days': 90, 'price': 1200, 'name': '3 месяца', 'currency': 'RUB'},
 }
 
@@ -220,19 +220,25 @@ VIDEO_INSTRUCTIONS = {
 }
 
 async def request_email(message_or_cb: types.Message | types.CallbackQuery, state: FSMContext):
-    user_id = message_or_cb.from_user.id
-    await bot.send_message(
-        user_id,
-        "Напишите ваш e-mail.\n"
-        "Отправляя e-mail, вы соглашаетесь с\n"
-        "<a href='https://www.vextr.ru/privacy'>Политикой конфиденциальности</a>\n"
-        "и <a href='https://www.vextr.ru/docs'>Политикой обработки персональных данных</a>",
-        parse_mode="HTML",
-        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
-            [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
-        ])
-    )
+    if isinstance(message_or_cb, types.Message):
+        user_id = message_or_cb.from_user.id
+    else:
+        user_id = message_or_cb.from_user.id
+    try:
+        await bot.send_message(
+            user_id,
+            "Напишите ваш e-mail.\n"
+            "Отправляя e-mail, вы соглашаетесь с\n"
+            "<a href='https://www.vextr.ru/privacy'>Политикой конфиденциальности</a>\n"
+            "и <a href='https://www.vextr.ru/docs'>Политикой обработки персональных данных</a>",
+            parse_mode="HTML",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="Отмена", callback_data="cancel")],
+                [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+            ])
+        )
+    except TelegramForbiddenError:
+        logging.error(f"Cannot send message to user {user_id}: Forbidden (bots can't message bots)")
     await state.set_state(PaymentStates.waiting_for_email)
 
 # ------------------- Обработчики -------------------
@@ -318,9 +324,8 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
             (user_id, user_id, "regular", user_id, "regular")
         )
         conn.commit()
-        await callback_query.message.edit_text("Выберите биржу:", reply_markup=get_exchange_keyboard())
+        await callback_query.message.edit_text("Выберите тариф:", reply_markup=get_tariffs_keyboard())
         await state.update_data(subscription_type="regular")
-        await state.set_state(PaymentStates.waiting_for_exchange)
 
 # ------------------- Выбор биржи (ВИДЕО ДЛЯ ВСЕХ) -------------------
 @router.callback_query(F.data.startswith("exchange:"))
@@ -414,7 +419,7 @@ async def process_promo(message: types.Message, state: FSMContext):
         return
 
     cursor.execute(
-        "SELECT username, status FROM affiliate_applications WHERE UPPER(promo_code) = %s",
+        "SELECT username, status, discount FROM affiliate_applications WHERE UPPER(promo_code) = %s",
         (promo,)
     )
     res = cursor.fetchone()
@@ -424,7 +429,9 @@ async def process_promo(message: types.Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    final_price = data['tariff_price']
+    original_price = data['tariff_price']
+    discount = res['discount'] or 0  # Если discount NULL, то 0
+    final_price = round(original_price * (1 - discount / 100), 2)  # Рассчитываем скидку, округляем до 2 знаков
 
     await state.update_data(
         final_price=final_price,
@@ -434,6 +441,7 @@ async def process_promo(message: types.Message, state: FSMContext):
     await message.answer(
         f"Промокод принят!\n"
         f"От партнёра: <b>@{res['username']}</b>\n"
+        f"Скидка: <b>{discount}%</b>\n"
         f"К оплате: <b>{final_price}₽</b>",
         parse_mode="HTML"
     )
@@ -442,8 +450,11 @@ async def process_promo(message: types.Message, state: FSMContext):
 @router.callback_query(F.data == "skip_promo")
 async def skip_promo(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.message.delete()
-    await bot.send_message(callback_query.from_user.id, "Промокод пропущен.")
-    await request_email(callback_query.message, state)
+    try:
+        await bot.send_message(callback_query.from_user.id, "Промокод пропущен.")
+    except TelegramForbiddenError:
+        logging.error(f"Cannot send message to user {callback_query.from_user.id}: Forbidden (bots can't message bots)")
+    await request_email(callback_query, state)
 
 @router.message(PaymentStates.waiting_for_email)
 async def process_email(message: types.Message, state: FSMContext):
@@ -456,7 +467,7 @@ async def process_email(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     tariff = TARIFFS[data['tariff_id']]
-    final_price = tariff['price']
+    final_price = data['final_price']
     affirmate = data.get('affirmate_username')
     description = f"Подписка {tariff['name']}" + (f" (промокод @{affirmate})" if affirmate else "")
 
