@@ -113,10 +113,7 @@ async def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
                     "take_profit_2": None,
                     "take_profit_3": None
                 }
-                loop = asyncio.get_event_loop()
-                asyncio.run_coroutine_threadsafe(
-                    send_signal_notification(notification, user_id), loop
-                )
+                await send_signal_notification(notification, user_id, bot)
             except Exception as notify_error:
                 logger.error(f"Ошибка отправки уведомления о закрытии для {user_id}: {notify_error}")
         else:
@@ -139,14 +136,10 @@ async def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
             ])
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(
-                bot.send_message(
-                    chat_id=user_id,
-                    text=f"❌ Не удалось закрыть предыдущую сделку по {symbol}. Пожалуйста, проверьте биржу и свяжитесь с поддержкой.",
-                    reply_markup=keyboard
-                ),
-                loop
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Не удалось закрыть предыдущую сделку по {symbol}. Пожалуйста, проверьте биржу и свяжитесь с поддержкой.",
+                reply_markup=keyboard
             )
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления об ошибке закрытия для {user_id}: {notify_error}")
@@ -222,10 +215,7 @@ async def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
                         "take_profit_2": None,
                         "take_profit_3": None
                     }
-                    loop = asyncio.get_event_loop()
-                    asyncio.run_coroutine_threadsafe(
-                        send_signal_notification(notification, user_id), loop
-                    )
+                    await send_signal_notification(notification, user_id, bot)
                     logger.info(f"Уведомление о закрытии сделки отправлено для пользователя {user_id}")
                 except Exception as notify_error:
                     logger.error(f"Ошибка отправки уведомления о закрытии для {user_id}: {notify_error}")
@@ -239,14 +229,10 @@ async def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
             ])
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(
-                bot.send_message(
-                    chat_id=user_id,
-                    text=f"❌ Не удалось закрыть предыдущую сделку по {symbol}. Пожалуйста, проверьте биржу и свяжитесь с поддержкой.",
-                    reply_markup=keyboard
-                ),
-                loop
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Не удалось закрыть предыдущую сделку по {symbol}. Пожалуйста, проверьте биржу и свяжитесь с поддержкой.",
+                reply_markup=keyboard
             )
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления об ошибке закрытия для {user_id}: {notify_error}")
@@ -343,7 +329,6 @@ async def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         commit()
 
         try:
-            loop = asyncio.get_event_loop()
             await send_signal_notification(signal, user_id, bot)
             logger.info(f"Запущена отправка уведомления для пользователя {user_id}")
         except Exception as notify_error:
@@ -364,14 +349,10 @@ async def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
             ])
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(
-                bot.send_message(
-                    chat_id=user_id,
-                    text=f"❌ Ошибка обработки сигнала для {symbol}. Пожалуйста, свяжитесь с поддержкой.",
-                    reply_markup=keyboard
-                ),
-                loop
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Ошибка обработки сигнала для {symbol}. Пожалуйста, свяжитесь с поддержкой.",
+                reply_markup=keyboard
             )
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
@@ -442,7 +423,6 @@ async def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         commit()
 
         try:
-            loop = asyncio.get_event_loop()
             await send_signal_notification(signal, user_id, bot)
             logger.info(f"Запущена отправка уведомления для пользователя {user_id}")
         except Exception as notify_error:
@@ -467,14 +447,10 @@ async def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
             ])
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(
-                bot.send_message(
-                    chat_id=user_id,
-                    text=f"❌ Ошибка обработки сигнала для {symbol}. Пожалуйста, свяжитесь с поддержкой.",
-                    reply_markup=keyboard
-                ),
-                loop
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Ошибка обработки сигнала для {symbol}. Пожалуйста, свяжитесь с поддержкой.",
+                reply_markup=keyboard
             )
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
@@ -498,10 +474,7 @@ async def process_bingx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
                 "symbol": symbol,
                 "message": f"Стоп-лосс перемещен к цене входа для {symbol}"
             }
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(
-                send_signal_notification(notification, user_id), loop
-            )
+            await send_signal_notification(notification, user_id, bot)
 
             return {
                 "user_id": user_id,
@@ -534,10 +507,7 @@ async def process_okx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
                 "symbol": symbol,
                 "message": f"Стоп-лосс перемещен к цене входа для {symbol}"
             }
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(
-                send_signal_notification(notification, user_id), loop
-            )
+            await send_signal_notification(notification, user_id, bot)
 
             return {
                 "user_id": user_id,
