@@ -1,10 +1,11 @@
-import time
-import json
-import logging
-import asyncio
-from aiogram import types
 import os
+import logging
+import json
+import time
+import asyncio
 from typing import Dict, Optional
+from aiogram import types
+from telegram import Bot
 from database import get_cursor, commit
 from utils import send_signal_notification
 from main import bot
@@ -17,7 +18,8 @@ from bingx_api import (
     get_open_orders as bingx_get_open_orders,
     cancel_order as bingx_cancel_order,
     close_position as bingx_close_position,
-    get_open_positions as bingx_get_open_positions
+    get_open_positions as bingx_get_open_positions,
+    move_sl_to_breakeven as bingx_move_sl_to_breakeven
 )
 from okx_api import (
     get_balance as okx_get_balance,
@@ -25,12 +27,32 @@ from okx_api import (
     calculate_quantity as okx_calculate_quantity,
     create_main_order as okx_create_main_order,
     cancel_order as okx_cancel_order,
-    get_order_status,
-    close_position as okx_close_position
+    get_order_status as okx_get_order_status,
+    close_position as okx_close_position,
+    move_sl_to_breakeven as okx_move_sl_to_breakeven
+)
+from bybit_api import (
+    get_balance as bybit_get_balance,
+    set_leverage as bybit_set_leverage,
+    calculate_quantity as bybit_calculate_quantity,
+    create_main_order as bybit_create_main_order,
+    cancel_order as bybit_cancel_order,
+    get_order_status as bybit_get_order_status,
+    close_position as bybit_close_position,
+    move_sl_to_breakeven as bybit_move_sl_to_breakeven
+)
+from bitget_api import (
+    get_balance as bitget_get_balance,
+    set_leverage as bitget_set_leverage,
+    calculate_quantity as bitget_calculate_quantity,
+    create_main_order as bitget_create_main_order,
+    cancel_order as bitget_cancel_order,
+    get_order_status as bitget_get_order_status,
+    close_position as bitget_close_position,
+    move_sl_to_breakeven as bitget_move_sl_to_breakeven
 )
 
 logger = logging.getLogger(__name__)
-
 
 async def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
     user_id = user['user_id']
@@ -145,7 +167,6 @@ async def close_bingx_trade(user: Dict, symbol: str, current_side: str) -> bool:
             logger.error(f"Ошибка отправки уведомления об ошибке закрытия для {user_id}: {notify_error}")
         return False
 
-
 async def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
     user_id = user['user_id']
     api_key = user['api_key']
@@ -179,7 +200,7 @@ async def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
                 for order_id in order_ids:
                     if order_id:
                         try:
-                            order_status = get_order_status(symbol, order_id, api_key, secret_key, passphrase)
+                            order_status = okx_get_order_status(symbol, order_id, api_key, secret_key, passphrase)
                             if order_status['state'] in ['canceled', 'filled']:
                                 logger.info(
                                     f"Ордер {order_id} для {symbol} уже закрыт (статус: {order_status['state']})")
@@ -238,6 +259,184 @@ async def close_okx_trade(user: Dict, symbol: str, current_side: str) -> bool:
             logger.error(f"Ошибка отправки уведомления об ошибке закрытия для {user_id}: {notify_error}")
         return False
 
+async def close_bybit_trade(user: Dict, symbol: str, current_side: str) -> bool:
+    user_id = user['user_id']
+    api_key = user['api_key']
+    secret_key = user['secret_key']
+
+    try:
+        cursor = get_cursor()
+        cursor.execute(
+            """
+            SELECT trade_id, order_id, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, side
+            FROM trades
+            WHERE user_id = %s AND symbol = %s AND status = %s
+            """,
+            (user_id, symbol, 'open')
+        )
+        open_trades = cursor.fetchall()
+
+        if not open_trades:
+            logger.info(f"Нет открытых сделок для пользователя {user_id} по символу {symbol}")
+            return False
+
+        closed = False
+        pos_side = "net"  # Bybit использует хедж-режим по умолчанию
+        for trade in open_trades:
+            if trade['side'] != current_side:
+                order_ids = [trade['order_id'], trade['sl_order_id'], trade['tp1_order_id'],
+                             trade['tp2_order_id'], trade['tp3_order_id']]
+
+                # Отменяем ордера
+                for order_id in order_ids:
+                    if order_id:
+                        try:
+                            bybit_cancel_order(symbol, order_id, api_key, secret_key)
+                            closed = True
+                        except Exception as e:
+                            logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
+                            continue
+
+                # Закрываем позицию
+                try:
+                    bybit_close_position(symbol, pos_side, api_key, secret_key)
+                    closed = True
+                except Exception as e:
+                    logger.warning(f"Не удалось закрыть позицию для {symbol}: {str(e)}")
+
+                cursor.execute(
+                    "UPDATE trades SET status = %s WHERE trade_id = %s",
+                    ('closed', trade['trade_id'])
+                )
+                commit()
+
+                # Отправляем уведомление
+                try:
+                    notification = {
+                        "action": f"CLOSE_{trade['side']}",
+                        "symbol": symbol,
+                        "price": 0,
+                        "stop_loss": None,
+                        "take_profit_1": None,
+                        "take_profit_2": None,
+                        "take_profit_3": None
+                    }
+                    await send_signal_notification(notification, user_id, bot)
+                    logger.info(f"Уведомление о закрытии сделки отправлено для пользователя {user_id}")
+                except Exception as notify_error:
+                    logger.error(f"Ошибка отправки уведомления о закрытии для {user_id}: {notify_error}")
+
+        return closed
+
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии сделки Bybit для пользователя {user_id}: {str(e)}")
+        SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@SupportBot")
+        try:
+            keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+            ])
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Не удалось закрыть предыдущую сделку по {symbol}. Пожалуйста, проверьте биржу и свяжитесь с поддержкой.",
+                reply_markup=keyboard
+            )
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления об ошибке закрытия для {user_id}: {notify_error}")
+        return False
+
+async def close_bitget_trade(user: Dict, symbol: str, current_side: str) -> bool:
+    user_id = user['user_id']
+    api_key = user['api_key']
+    secret_key = user['secret_key']
+    passphrase = user['passphrase']
+
+    try:
+        cursor = get_cursor()
+        cursor.execute(
+            """
+            SELECT trade_id, order_id, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, side, position_side
+            FROM trades
+            WHERE user_id = %s AND symbol = %s AND status = %s
+            """,
+            (user_id, symbol, 'open')
+        )
+        open_trades = cursor.fetchall()
+
+        if not open_trades:
+            logger.info(f"Нет открытых сделок для пользователя {user_id} по символу {symbol}")
+            return False
+
+        closed = False
+        for trade in open_trades:
+            if trade['side'] != current_side:
+                pos_side = trade['position_side']  # Используем position_side из базы
+                order_ids = [trade['order_id'], trade['sl_order_id'], trade['tp1_order_id'],
+                             trade['tp2_order_id'], trade['tp3_order_id']]
+
+                # Отменяем ордера
+                for order_id in order_ids:
+                    if order_id:
+                        try:
+                            bitget_cancel_order(symbol, order_id, api_key, secret_key, passphrase)
+                            logger.info(f"Ордер {order_id} для {symbol} успешно отменён")
+                            closed = True
+                        except Exception as e:
+                            if "order not exist" in str(e).lower():
+                                logger.info(f"Ордер {order_id} для {symbol} уже не существует")
+                            else:
+                                logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
+                                continue
+
+                # Закрываем позицию
+                try:
+                    bitget_close_position(symbol, pos_side, api_key, secret_key, passphrase)
+                    logger.info(f"Позиция {pos_side} для {symbol} закрыта")
+                    closed = True
+                except Exception as e:
+                    if "position not exist" in str(e).lower():
+                        logger.info(f"Позиция {pos_side} для {symbol} уже не существует")
+                    else:
+                        logger.error(f"Ошибка при закрытии позиции {pos_side} для {symbol}: {str(e)}")
+
+                cursor.execute(
+                    "UPDATE trades SET status = %s WHERE trade_id = %s",
+                    ('closed', trade['trade_id'])
+                )
+                commit()
+
+                # Отправляем уведомление
+                try:
+                    notification = {
+                        "action": f"CLOSE_{trade['side']}",
+                        "symbol": symbol,
+                        "price": 0,
+                        "stop_loss": None,
+                        "take_profit_1": None,
+                        "take_profit_2": None,
+                        "take_profit_3": None
+                    }
+                    await send_signal_notification(notification, user_id, bot)
+                    logger.info(f"Уведомление о закрытии сделки отправлено для пользователя {user_id}")
+                except Exception as notify_error:
+                    logger.error(f"Ошибка отправки уведомления о закрытии для {user_id}: {notify_error}")
+
+        return closed
+
+    except Exception as e:
+        logger.error(f"Ошибка при закрытии сделки Bitget для пользователя {user_id}: {str(e)}")
+        SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@SupportBot")
+        try:
+            keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+            ])
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Не удалось закрыть предыдущую сделку по {symbol}. Пожалуйста, проверьте биржу и свяжитесь с поддержкой.",
+                reply_markup=keyboard
+            )
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления об ошибке закрытия для {user_id}: {notify_error}")
+        return False
 
 async def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     user_id = user['user_id']
@@ -358,7 +557,6 @@ async def process_bingx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
         return None
 
-
 async def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
     user_id = user['user_id']
     api_key = user['api_key']
@@ -432,7 +630,7 @@ async def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             "user_id": user_id,
             "exchange": "okx",
             "trade_id": trade_id,
-            "position_side": position_side,  # Добавляем position_side в ответ
+            "position_side": position_side,
             "main_order": main_order_response,
             "sl_order_id": sl_order_id,
             "tp1_order_id": tp1_order_id,
@@ -456,16 +654,201 @@ async def process_okx_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
         return None
 
+async def process_bybit_signal(user: Dict, signal: Dict) -> Optional[Dict]:
+    user_id = user['user_id']
+    api_key = user['api_key']
+    secret_key = user['secret_key']
+
+    action = signal['action']
+    symbol = signal['symbol']
+    price = signal['price']
+    stop_loss = signal['stop_loss']
+    take_profits = [signal['take_profit_1'], signal['take_profit_2'], signal['take_profit_3']]
+
+    try:
+        # Закрываем противоположные сделки
+        await close_bybit_trade(user, symbol, action)
+
+        usdt_balance = bybit_get_balance(api_key, secret_key)
+        if usdt_balance < 10:
+            logger.error(f"Недостаточный баланс для пользователя {user_id}: {usdt_balance} USDT")
+            return None
+
+        # Устанавливаем плечо
+        leverage_set = bybit_set_leverage(symbol, leverage=10, tdMode="isolated",
+                                         api_key=api_key, secret_key=secret_key)
+        if not leverage_set:
+            logger.warning(f"Не удалось установить плечо для {symbol}, продолжаем...")
+
+        quantity = bybit_calculate_quantity(symbol, leverage=10, risk_percent=0.05,
+                                           api_key=api_key, secret_key=secret_key)
+
+        main_order_response, sorted_take_profits, order_id, algo_order_ids, position_side = bybit_create_main_order(
+            symbol=symbol,
+            side=action,
+            quantity=quantity,
+            stop_loss=stop_loss,
+            take_profits=take_profits,
+            tdMode="isolated",
+            api_key=api_key,
+            secret_key=secret_key
+        )
+
+        sl_order_id = algo_order_ids[0] if algo_order_ids else None
+        tp1_order_id = algo_order_ids[1] if len(algo_order_ids) > 1 else None
+        tp2_order_id = algo_order_ids[2] if len(algo_order_ids) > 2 else None
+        tp3_order_id = algo_order_ids[3] if len(algo_order_ids) > 3 else None
+
+        cursor = get_cursor()
+        cursor.execute(
+            """
+            INSERT INTO trades (user_id, exchange, order_id, symbol, side, position_side, quantity, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING trade_id
+            """,
+            (user_id, 'bybit', order_id, symbol, action, position_side, quantity, price, stop_loss,
+             take_profits[0], take_profits[1], take_profits[2], sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id,
+             'open')
+        )
+        trade_id = cursor.fetchone()['trade_id']
+        commit()
+
+        try:
+            await send_signal_notification(signal, user_id, bot)
+            logger.info(f"Запущена отправка уведомления для пользователя {user_id}")
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления для user {user_id}: {notify_error}")
+
+        return {
+            "user_id": user_id,
+            "exchange": "bybit",
+            "trade_id": trade_id,
+            "position_side": position_side,
+            "main_order": main_order_response,
+            "sl_order_id": sl_order_id,
+            "tp1_order_id": tp1_order_id,
+            "tp2_order_id": tp2_order_id,
+            "tp3_order_id": tp3_order_id
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки сигнала Bybit для пользователя {user_id}: {str(e)}")
+        SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@SupportBot")
+        try:
+            keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+            ])
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Ошибка обработки сигнала для {symbol}. Пожалуйста, свяжитесь с поддержкой.",
+                reply_markup=keyboard
+            )
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
+        return None
+
+async def process_bitget_signal(user: Dict, signal: Dict) -> Optional[Dict]:
+    user_id = user['user_id']
+    api_key = user['api_key']
+    secret_key = user['secret_key']
+    passphrase = user['passphrase']
+
+    action = signal['action']
+    symbol = signal['symbol']
+    price = signal['price']
+    stop_loss = signal['stop_loss']
+    take_profits = [signal['take_profit_1'], signal['take_profit_2'], signal['take_profit_3']]
+
+    try:
+        # Закрываем противоположные сделки
+        await close_bitget_trade(user, symbol, action)
+
+        usdt_balance = bitget_get_balance(api_key, secret_key, passphrase)
+        if usdt_balance < 10:
+            logger.error(f"Недостаточный баланс для пользователя {user_id}: {usdt_balance} USDT")
+            return None
+
+        # Устанавливаем плечо
+        leverage_set = bitget_set_leverage(symbol, leverage=10, tdMode="isolated",
+                                          api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+        if not leverage_set:
+            logger.warning(f"Не удалось установить плечо для {symbol}, продолжаем...")
+
+        quantity = bitget_calculate_quantity(symbol, leverage=10, risk_percent=0.05,
+                                            api_key=api_key, secret_key=secret_key, passphrase=passphrase)
+
+        main_order_response, sorted_take_profits, order_id, algo_order_ids, position_side = bitget_create_main_order(
+            symbol=symbol,
+            side=action,
+            quantity=quantity,
+            stop_loss=stop_loss,
+            take_profits=take_profits,
+            tdMode="isolated",
+            api_key=api_key,
+            secret_key=secret_key,
+            passphrase=passphrase
+        )
+
+        sl_order_id = algo_order_ids[0] if algo_order_ids else None
+        tp1_order_id = algo_order_ids[1] if len(algo_order_ids) > 1 else None
+        tp2_order_id = algo_order_ids[2] if len(algo_order_ids) > 2 else None
+        tp3_order_id = algo_order_ids[3] if len(algo_order_ids) > 3 else None
+
+        cursor = get_cursor()
+        cursor.execute(
+            """
+            INSERT INTO trades (user_id, exchange, order_id, symbol, side, position_side, quantity, entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3, sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING trade_id
+            """,
+            (user_id, 'bitget', order_id, symbol, action, position_side, quantity, price, stop_loss,
+             take_profits[0], take_profits[1], take_profits[2], sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id,
+             'open')
+        )
+        trade_id = cursor.fetchone()['trade_id']
+        commit()
+
+        try:
+            await send_signal_notification(signal, user_id, bot)
+            logger.info(f"Запущена отправка уведомления для пользователя {user_id}")
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления для user {user_id}: {notify_error}")
+
+        return {
+            "user_id": user_id,
+            "exchange": "bitget",
+            "trade_id": trade_id,
+            "position_side": position_side,
+            "main_order": main_order_response,
+            "sl_order_id": sl_order_id,
+            "tp1_order_id": tp1_order_id,
+            "tp2_order_id": tp2_order_id,
+            "tp3_order_id": tp3_order_id
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки сигнала Bitget для пользователя {user_id}: {str(e)}")
+        SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "@SupportBot")
+        try:
+            keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="📞 Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+            ])
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"❌ Ошибка обработки сигнала для {symbol}. Пожалуйста, свяжитесь с поддержкой.",
+                reply_markup=keyboard
+            )
+        except Exception as notify_error:
+            logger.error(f"Ошибка отправки уведомления об ошибке для {user_id}: {notify_error}")
+        return None
+
 async def process_bingx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
-    """Обработка MOVE_SL для BingX"""
     user_id = user['user_id']
     api_key = user['api_key']
     secret_key = user['secret_key']
 
     try:
-        from bingx_api import move_sl_to_breakeven
-
-        success = move_sl_to_breakeven(symbol, api_key, secret_key)
+        success = bingx_move_sl_to_breakeven(symbol, api_key, secret_key)
 
         if success:
             # Отправляем уведомление
@@ -487,7 +870,6 @@ async def process_bingx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
         logger.error(f"Ошибка обработки MOVE_SL для пользователя {user_id}: {str(e)}")
         return None
 
-
 async def process_okx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
     """Обработка MOVE_SL для OKX"""
     user_id = user['user_id']
@@ -496,9 +878,7 @@ async def process_okx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
     passphrase = user['passphrase']
 
     try:
-        from okx_api import move_sl_to_breakeven
-
-        success = move_sl_to_breakeven(symbol, api_key, secret_key, passphrase)
+        success = okx_move_sl_to_breakeven(symbol, api_key, secret_key, passphrase)
 
         if success:
             # Отправляем уведомление
@@ -512,6 +892,65 @@ async def process_okx_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
             return {
                 "user_id": user_id,
                 "exchange": "okx",
+                "status": "success",
+                "message": f"SL перемещен к цене входа для {symbol}"
+            }
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки MOVE_SL для пользователя {user_id}: {str(e)}")
+        return None
+
+async def process_bybit_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
+    """Обработка MOVE_SL для Bybit"""
+    user_id = user['user_id']
+    api_key = user['api_key']
+    secret_key = user['secret_key']
+
+    try:
+        success = bybit_move_sl_to_breakeven(symbol, api_key, secret_key)
+
+        if success:
+            # Отправляем уведомление
+            notification = {
+                "action": "MOVE_SL",
+                "symbol": symbol,
+                "message": f"Стоп-лосс перемещен к цене входа для {symbol}"
+            }
+            await send_signal_notification(notification, user_id, bot)
+
+            return {
+                "user_id": user_id,
+                "exchange": "bybit",
+                "status": "success",
+                "message": f"SL перемещен к цене входа для {symbol}"
+            }
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки MOVE_SL для пользователя {user_id}: {str(e)}")
+        return None
+
+async def process_bitget_move_sl(user: Dict, symbol: str) -> Optional[Dict]:
+    """Обработка MOVE_SL для Bitget"""
+    user_id = user['user_id']
+    api_key = user['api_key']
+    secret_key = user['secret_key']
+    passphrase = user['passphrase']
+
+    try:
+        success = bitget_move_sl_to_breakeven(symbol, api_key, secret_key, passphrase)
+
+        if success:
+            # Отправляем уведомление
+            notification = {
+                "action": "MOVE_SL",
+                "symbol": symbol,
+                "message": f"Стоп-лосс перемещен к цене входа для {symbol}"
+            }
+            await send_signal_notification(notification, user_id, bot)
+
+            return {
+                "user_id": user_id,
+                "exchange": "bitget",
                 "status": "success",
                 "message": f"SL перемещен к цене входа для {symbol}"
             }

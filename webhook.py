@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-
 def clean_json_data(data_str: str) -> dict:
     """Очищает JSON данные от NaN и других невалидных значений"""
     try:
@@ -20,7 +19,6 @@ def clean_json_data(data_str: str) -> dict:
     except json.JSONDecodeError as e:
         logger.error(f"Ошибка парсинга JSON: {str(e)}")
         raise
-
 
 async def handle_move_sl_signal(data: dict):
     """Обработка сигнала MOVE_SL"""
@@ -53,6 +51,12 @@ async def handle_move_sl_signal(data: dict):
             elif exchange == 'okx':
                 from services import process_okx_move_sl
                 result = await process_okx_move_sl(user, normalized_symbol)
+            elif exchange == 'bybit':
+                from services import process_bybit_move_sl
+                result = await process_bybit_move_sl(user, normalized_symbol)
+            elif exchange == "bitget":
+                from services import process_bitget_move_sl
+                result = await process_bitget_move_sl(user, normalized_symbol)
             else:
                 logger.error(f"Неизвестная биржа: {exchange} для пользователя {user_id}")
                 continue
@@ -74,7 +78,6 @@ async def handle_move_sl_signal(data: dict):
         "symbol": symbol,
         "results": results
     }
-
 
 @router.post("/webhook")
 async def webhook(request: Request):
@@ -195,6 +198,12 @@ async def webhook(request: Request):
                 elif exchange == 'okx':
                     from services import process_okx_signal
                     result = await process_okx_signal(user, signal)
+                elif exchange == 'bybit':
+                    from services import process_bybit_signal
+                    result = await process_bybit_signal(user, signal)
+                elif exchange == "bitget":
+                    from services import process_bitget_signal
+                    result = await process_bitget_signal(user, signal)
                 else:
                     logger.error(f"Неизвестная биржа: {exchange} для пользователя {user_id}")
                     continue

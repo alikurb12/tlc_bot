@@ -31,6 +31,12 @@ def normalize_symbol(symbol: str, exchange: str) -> str:
         normalized = symbol
         logger.info(f"Нормализованный символ для OKX: {normalized}")
         return normalized
+    elif exchange == "bitget":
+        if not symbol.endswith("_UMCBL"):
+            symbol = f"{symbol}_UMCBL"
+            normalized = symbol
+            return normalized
+    return symbol
 
     logger.warning(f"Неизвестная биржа: {exchange}, возвращаем исходный символ: {symbol}")
     return symbol

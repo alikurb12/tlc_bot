@@ -184,8 +184,12 @@ def get_tariffs_keyboard():
 
 def get_exchange_keyboard():
     return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="BingX", callback_data="exchange:bingx"),
-         types.InlineKeyboardButton(text="OKX", callback_data="exchange:okx")],
+        [
+            types.InlineKeyboardButton(text="BingX", callback_data="exchange:bingx"),
+            types.InlineKeyboardButton(text="OKX", callback_data="exchange:okx"),
+            types.InlineKeyboardButton(text="Bybit", callback_data="exchange:bybit"),
+            types.InlineKeyboardButton(text="Bitget", callback_data="exchange:bitget")
+        ],
         [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
     ])
 
@@ -216,7 +220,9 @@ async def is_bot_in_group():
 
 VIDEO_INSTRUCTIONS = {
     'bingx': 'videos/bingx.mp4',
-    'okx': 'videos/okx.mp4'
+    'okx': 'videos/okx.mp4',
+    'bybit': 'videos/bybit.mp4',
+    'bitget': 'videos/bitget.mp4'  # Убедитесь, что файл существует
 }
 
 async def request_email(message_or_cb: types.Message | types.CallbackQuery, state: FSMContext):
@@ -303,7 +309,7 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
         cur = cursor.fetchone()
         if cur and cur['subscription_type'] == "referral_approved":
             await callback_query.message.edit_text("Реферальная подписка активна.\nВыберите биржу:", reply_markup=get_exchange_keyboard())
-            await state.set_state(PaymentStates.waiting_for_api_key)
+            await state.set_state(PaymentStates.waiting_for_exchange)
             return
 
         await callback_query.message.edit_text("Выберите биржу для реферала:", reply_markup=get_exchange_keyboard())
@@ -327,7 +333,6 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
         await callback_query.message.edit_text("Выберите тариф:", reply_markup=get_tariffs_keyboard())
         await state.update_data(subscription_type="regular")
 
-# ------------------- Выбор биржи (ВИДЕО ДЛЯ ВСЕХ) -------------------
 @router.callback_query(F.data.startswith("exchange:"))
 async def process_exchange(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
@@ -343,7 +348,6 @@ async def process_exchange(callback_query: types.CallbackQuery, state: FSMContex
         )
         return
 
-    # ← ВИДЕО ДЛЯ ВСЕХ
     video_path = VIDEO_INSTRUCTIONS.get(exchange)
     if video_path and os.path.exists(video_path):
         try:
@@ -351,11 +355,9 @@ async def process_exchange(callback_query: types.CallbackQuery, state: FSMContex
         except Exception as e:
             logging.error(f"Ошибка отправки видео: {e}")
 
-    # ← Сохраняем биржу
     cursor.execute("UPDATE users SET exchange = %s WHERE user_id = %s", (exchange, user_id))
     conn.commit()
 
-    # ← Если подписка уже активна — сразу API
     if res['subscription_end'] and res['subscription_end'] > datetime.datetime.now():
         await callback_query.message.edit_text(f"Биржа {exchange.upper()} выбрана.\n\nВведите ваш API-ключ:")
         await bot.send_message(user_id, "Введите ваш API-ключ:", reply_markup=types.ReplyKeyboardRemove())
@@ -363,7 +365,6 @@ async def process_exchange(callback_query: types.CallbackQuery, state: FSMContex
         await state.set_state(PaymentStates.waiting_for_api_key)
         return
 
-    # ← Если реферальный — ждём UUID
     if res['subscription_type'] == "referral_pending":
         await callback_query.message.edit_text("Видео отправлено.\n\nВведите UUID:")
         await state.update_data(exchange=exchange)
@@ -373,7 +374,6 @@ async def process_exchange(callback_query: types.CallbackQuery, state: FSMContex
         await state.update_data(exchange=exchange)
         await state.set_state(PaymentStates.waiting_for_payment)
 
-# ------------------- Выбор тарифа (промокод ТОЛЬКО для 1 месяца) -------------------
 @router.callback_query(F.data.startswith("tariff:"))
 async def process_tariff_selection(callback_query: types.CallbackQuery, state: FSMContext):
     tariff_id = callback_query.data.split(":")[1]
@@ -430,8 +430,8 @@ async def process_promo(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     original_price = data['tariff_price']
-    discount = res['discount'] or 0  # Если discount NULL, то 0
-    final_price = round(original_price * (1 - discount / 100), 2)  # Рассчитываем скидку, округляем до 2 знаков
+    discount = res['discount'] or 0
+    final_price = round(original_price * (1 - discount / 100), 2)
 
     await state.update_data(
         final_price=final_price,
@@ -596,7 +596,6 @@ async def process_referral_uuid(message: types.Message, state: FSMContext):
     await message.answer("UUID отправлен. Ожидайте.")
     await state.clear()
 
-# ------------------- Модерация рефералов -------------------
 @router.callback_query(F.data.startswith("approve_uuid:"))
 async def approve_referral(callback_query: types.CallbackQuery):
     user_id = int(callback_query.data.split(":")[1])
@@ -639,7 +638,6 @@ async def reject_referral(callback_query: types.CallbackQuery):
         reply_markup=None
     )
 
-# ------------------- Подключение API -------------------
 @router.message(F.text == "Подключить API")
 async def connect_api(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -727,10 +725,10 @@ async def process_secret_key(message: types.Message, state: FSMContext):
     api_key = data['api_key']
     await state.update_data(secret_key=secret)
 
-    if exchange == 'okx':
+    if exchange in ['bingx', 'okx', 'bitget']:
         await message.answer("Введите Passphrase:")
         await state.set_state(PaymentStates.waiting_for_passphrase)
-    else:
+    else:  # Bybit не требует passphrase
         cursor.execute(
             "UPDATE users SET api_key = %s, secret_key = %s, exchange = %s WHERE user_id = %s",
             (api_key, secret, exchange, message.from_user.id)
