@@ -5,7 +5,7 @@ import time
 import asyncio
 from typing import Dict, Optional
 from aiogram import types
-from telegram import Bot
+from main import bot
 from database import get_cursor, commit
 from utils import send_signal_notification
 from main import bot
