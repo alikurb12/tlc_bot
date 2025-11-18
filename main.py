@@ -195,13 +195,23 @@ def get_exchange_keyboard():
         [types.InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
     ])
 
+
 def get_main_menu(user_id):
-    buttons = [[types.KeyboardButton(text="Подключить API")]]
-    cursor.execute("SELECT subscription_end FROM users WHERE user_id = %s", (user_id,))
+    cursor.execute("SELECT subscription_end, api_key FROM users WHERE user_id = %s", (user_id,))
     res = cursor.fetchone()
+
+    buttons = []
+
+    # Кнопка "Подключить API" показывается всегда, если API не подключен
+    if not res or not res['api_key']:
+        buttons.append([types.KeyboardButton(text="Подключить API")])
+
+    # Кнопка "Информация о подписке" показывается только при активной подписке
     if res and res['subscription_end'] and res['subscription_end'] > datetime.datetime.now():
         buttons.append([types.KeyboardButton(text="Информация о подписке")])
+
     buttons.append([types.KeyboardButton(text="Поддержка")])
+
     return types.ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 def get_support_kb():
@@ -256,14 +266,52 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer("Бот не в группе или без прав админа.", reply_markup=get_support_kb())
         return
 
-    cursor.execute("SELECT terms_accepted FROM users WHERE user_id = %s", (message.from_user.id,))
+    user_id = message.from_user.id
+
+    # Проверяем есть ли пользователь в базе и активна ли подписка
+    cursor.execute("""
+        SELECT terms_accepted, subscription_end, api_key, exchange 
+        FROM users WHERE user_id = %s
+    """, (user_id,))
     res = cursor.fetchone()
 
+    # Если пользователь уже есть в базе и у него активная подписка
+    if res and res['subscription_end'] and res['subscription_end'] > datetime.datetime.now():
+        # Показываем информацию о подписке и главное меню
+        sub_type = "Активная"
+        end_date = res['subscription_end'].strftime('%d.%m.%Y %H:%M')
+        api_status = "Подключён" if res['api_key'] else "Не подключён"
+        exchange_name = res['exchange'].upper() if res['exchange'] else "Не выбрана"
+
+        await message.answer(
+            f"**С возвращением!**\n\n"
+            f"**Статус подписки:** {sub_type}\n"
+            f"**Активна до:** {end_date}\n"
+            f"**Биржа:** {exchange_name}\n"
+            f"**API:** {api_status}\n\n"
+            f"Выберите действие:",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu(user_id)
+        )
+        await state.clear()
+        return
+
+    # Если пользователь есть, но подписка истекла
+    if res and res['subscription_end'] and res['subscription_end'] <= datetime.datetime.now():
+        await message.answer(
+            "Ваша подписка истекла. Для продления выберите тип подписки:",
+            reply_markup=get_subscription_type_keyboard()
+        )
+        await state.set_state(PaymentStates.waiting_for_subscription_type)
+        return
+
+    # Если пользователь есть и принял условия, но нет подписки
     if res and res['terms_accepted']:
         await message.answer("Выберите тип подписки:", reply_markup=get_subscription_type_keyboard())
         await state.set_state(PaymentStates.waiting_for_subscription_type)
         return
 
+    # Новый пользователь или не принял условия
     await message.answer(
         "Добро пожаловать в торгового бота VEXTR!\n\n"
         "Торговля на финансовых рынках связана с рисками.\n\n"
