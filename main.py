@@ -187,6 +187,8 @@ def get_exchange_keyboard():
         [
             types.InlineKeyboardButton(text="BingX", callback_data="exchange:bingx"),
             types.InlineKeyboardButton(text="OKX", callback_data="exchange:okx"),
+        ],
+        [
             types.InlineKeyboardButton(text="Bybit", callback_data="exchange:bybit"),
             types.InlineKeyboardButton(text="Bitget", callback_data="exchange:bitget")
         ],
@@ -698,6 +700,7 @@ async def subscription_info(message: types.Message):
 async def contact_support(message: types.Message):
     await message.answer(f"Поддержка: {SUPPORT_CONTACT}", reply_markup=get_main_menu(message.from_user.id))
 
+
 @router.message(PaymentStates.waiting_for_api_key)
 async def process_api_key(message: types.Message, state: FSMContext):
     key = message.text.strip()
@@ -714,28 +717,37 @@ async def process_api_key(message: types.Message, state: FSMContext):
     await message.answer("Введите Secret Key:")
     await state.set_state(PaymentStates.waiting_for_secret_key)
 
+
 @router.message(PaymentStates.waiting_for_secret_key)
 async def process_secret_key(message: types.Message, state: FSMContext):
     secret = message.text.strip()
     if len(secret) < 10:
         await message.answer("Secret Key короткий.")
         return
+
     data = await state.get_data()
     exchange = data['exchange']
     api_key = data['api_key']
-    await state.update_data(secret_key=secret)
+    user_id = message.from_user.id
 
-    if exchange in ['bingx', 'okx', 'bitget']:
-        await message.answer("Введите Passphrase:")
-        await state.set_state(PaymentStates.waiting_for_passphrase)
-    else:  # Bybit не требует passphrase
+    # Биржи, которые НЕ требуют passphrase
+    no_passphrase_exchanges = ['bingx', 'bitget', 'bybit']
+
+    if exchange in no_passphrase_exchanges:
+        # Сохраняем данные без passphrase
         cursor.execute(
             "UPDATE users SET api_key = %s, secret_key = %s, exchange = %s WHERE user_id = %s",
-            (api_key, secret, exchange, message.from_user.id)
+            (api_key, secret, exchange, user_id)
         )
         conn.commit()
-        await message.answer("API подключён!", reply_markup=get_main_menu(message.from_user.id))
+        await message.answer("API подключён!", reply_markup=get_main_menu(user_id))
         await state.clear()
+    else:
+        # Для остальных бирж запрашиваем passphrase
+        await state.update_data(secret_key=secret)
+        await message.answer("Введите Passphrase:")
+        await state.set_state(PaymentStates.waiting_for_passphrase)
+
 
 @router.message(PaymentStates.waiting_for_passphrase)
 async def process_passphrase(message: types.Message, state: FSMContext):
@@ -743,13 +755,16 @@ async def process_passphrase(message: types.Message, state: FSMContext):
     if len(passphrase) < 8:
         await message.answer("Passphrase короткий.")
         return
+
     data = await state.get_data()
+    user_id = message.from_user.id
+
     cursor.execute(
         "UPDATE users SET api_key = %s, secret_key = %s, passphrase = %s, exchange = %s WHERE user_id = %s",
-        (data['api_key'], data['secret_key'], passphrase, data['exchange'], message.from_user.id)
+        (data['api_key'], data['secret_key'], passphrase, data['exchange'], user_id)
     )
     conn.commit()
-    await message.answer("API и Passphrase сохранены!", reply_markup=get_main_menu(message.from_user.id))
+    await message.answer("API и Passphrase сохранены!", reply_markup=get_main_menu(user_id))
     await state.clear()
 
 @router.callback_query(F.data == "cancel")
