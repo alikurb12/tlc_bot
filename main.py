@@ -234,7 +234,7 @@ VIDEO_INSTRUCTIONS = {
     'bingx': 'videos/bingx.mp4',
     'okx': 'videos/okx.mp4',
     'bybit': 'videos/bybit.mp4',
-    'bitget': 'videos/bitget.mp4'  # Убедитесь, что файл существует
+    'bitget': 'videos/bitget.mp4'
 }
 
 async def request_email(message_or_cb: types.Message | types.CallbackQuery, state: FSMContext):
@@ -744,10 +744,17 @@ async def subscription_info(message: types.Message):
         reply_markup=get_main_menu(user_id)
     )
 
+
 @router.message(F.text == "Поддержка")
 async def contact_support(message: types.Message):
-    await message.answer(f"Поддержка: {SUPPORT_CONTACT}", reply_markup=get_main_menu(message.from_user.id))
+    support_kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="📞 Написать в поддержку", url=f"https://t.me/{SUPPORT_CONTACT.lstrip('@')}")]
+    ])
 
+    await message.answer(
+        "Если у вас возникли вопросы или проблемы - напишите в нашу службу поддержки:",
+        reply_markup=support_kb
+    )
 
 @router.message(PaymentStates.waiting_for_api_key)
 async def process_api_key(message: types.Message, state: FSMContext):
