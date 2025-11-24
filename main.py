@@ -11,9 +11,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.enums.chat_member_status import ChatMemberStatus
-import aiohttp
 from yoomoney import Client, Quickpay
 
 logging.basicConfig(level=logging.INFO)
@@ -331,9 +330,9 @@ async def process_terms(callback_query: types.CallbackQuery, state: FSMContext):
 
     if action == "accept":
         cursor.execute(
-            "INSERT INTO users (user_id, terms_accepted) VALUES (%s, TRUE) "
-            "ON CONFLICT (user_id) DO UPDATE SET terms_accepted = TRUE",
-            (user_id,)
+            "INSERT INTO users (user_id, chat_id, terms_accepted) VALUES (%s, %s, TRUE) "
+            "ON CONFLICT (user_id) DO UPDATE SET chat_id = %s, terms_accepted = TRUE",
+            (user_id, user_id, user_id)
         )
         conn.commit()
         await callback_query.message.edit_text(
@@ -366,9 +365,9 @@ async def process_subscription_type(callback_query: types.CallbackQuery, state: 
         await state.update_data(subscription_type="referral_pending")
 
         cursor.execute(
-            "INSERT INTO users (user_id, subscription_type) VALUES (%s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET subscription_type = %s",
-            (user_id, "referral_pending", "referral_pending")
+            "INSERT INTO users (user_id, chat_id, subscription_type) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET chat_id = %s, subscription_type = %s",
+            (user_id, user_id, "referral_pending", user_id, "referral_pending")
         )
         conn.commit()
 
