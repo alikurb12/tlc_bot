@@ -21,6 +21,14 @@ def normalize_symbol(symbol: str, exchange: str) -> str:
         logger.info(f"Нормализованный символ для BingX: {normalized}")
         return normalized
 
+    if exchange == "bybit":
+        # Убираем .P, .S, .PERP и т.д.
+        symbol = symbol.replace(".P", "").replace(".S", "").replace("PERP", "").upper()
+        # Bybit требует именно такой формат
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        return symbol
+
     elif exchange == 'okx':
         symbol = re.sub(r'\.P$', '', symbol)
         symbol = symbol.replace(':', '-').replace('/', '-')
@@ -37,6 +45,7 @@ def normalize_symbol(symbol: str, exchange: str) -> str:
             normalized = symbol
             return normalized
     return symbol
+
 
     logger.warning(f"Неизвестная биржа: {exchange}, возвращаем исходный символ: {symbol}")
     return symbol

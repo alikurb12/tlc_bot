@@ -281,29 +281,33 @@ async def close_bybit_trade(user: Dict, symbol: str, current_side: str) -> bool:
             return False
 
         closed = False
-        pos_side = "net"  # Bybit использует хедж-режим по умолчанию
         for trade in open_trades:
             if trade['side'] != current_side:
                 order_ids = [trade['order_id'], trade['sl_order_id'], trade['tp1_order_id'],
                              trade['tp2_order_id'], trade['tp3_order_id']]
 
-                # Отменяем ордера
+                # Отменяем ордера с правильными параметрами
                 for order_id in order_ids:
                     if order_id:
                         try:
-                            bybit_cancel_order(symbol, order_id, api_key, secret_key)
+                            # Используем именованные параметры
+                            bybit_cancel_order(symbol=symbol, order_id=order_id, api_key=api_key, secret_key=secret_key)
+                            logger.info(f"Ордер {order_id} для {symbol} успешно отменён")
                             closed = True
                         except Exception as e:
                             logger.error(f"Ошибка при отмене ордера {order_id} для {symbol}: {str(e)}")
                             continue
 
-                # Закрываем позицию
+                # Закрываем позицию с правильными параметрами
                 try:
-                    bybit_close_position(symbol, pos_side, api_key, secret_key)
+                    # Используем именованные параметры
+                    bybit_close_position(symbol=symbol, api_key=api_key, secret_key=secret_key)
+                    logger.info(f"Позиция для {symbol} закрыта")
                     closed = True
                 except Exception as e:
                     logger.warning(f"Не удалось закрыть позицию для {symbol}: {str(e)}")
 
+                # Обновляем статус в базе данных
                 cursor.execute(
                     "UPDATE trades SET status = %s WHERE trade_id = %s",
                     ('closed', trade['trade_id'])
@@ -338,7 +342,8 @@ async def close_bybit_trade(user: Dict, symbol: str, current_side: str) -> bool:
             await bot.send_message(
                 chat_id=user_id,
                 text=f"❌ Не удалось закрыть предыдущую сделку по {symbol}. Пожалуйста, проверьте биржу и свяжитесь с поддержкой.",
-                reply_markup=keyboard
+                reply_markup=keyboard,
+                parse_mode=None
             )
         except Exception as notify_error:
             logger.error(f"Ошибка отправки уведомления об ошибке закрытия для {user_id}: {notify_error}")
@@ -670,7 +675,7 @@ async def process_bybit_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         await close_bybit_trade(user, symbol, action)
 
         usdt_balance = bybit_get_balance(api_key, secret_key)
-        if usdt_balance < 10:
+        if usdt_balance < 5:
             logger.error(f"Недостаточный баланс для пользователя {user_id}: {usdt_balance} USDT")
             return None
 
@@ -683,7 +688,10 @@ async def process_bybit_signal(user: Dict, signal: Dict) -> Optional[Dict]:
         quantity = bybit_calculate_quantity(symbol, leverage=10, risk_percent=0.05,
                                            api_key=api_key, secret_key=secret_key)
 
-        main_order_response, sorted_take_profits, order_id, algo_order_ids, position_side = bybit_create_main_order(
+        # В services.py в функции process_bybit_signal:
+
+        # Получаем все 6 значений из функции
+        main_order_response, sorted_take_profits, order_id, algo_order_ids, position_side, sl_order_id = bybit_create_main_order(
             symbol=symbol,
             side=action,
             quantity=quantity,
@@ -694,11 +702,12 @@ async def process_bybit_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             secret_key=secret_key
         )
 
-        sl_order_id = algo_order_ids[0] if algo_order_ids else None
-        tp1_order_id = algo_order_ids[1] if len(algo_order_ids) > 1 else None
-        tp2_order_id = algo_order_ids[2] if len(algo_order_ids) > 2 else None
-        tp3_order_id = algo_order_ids[3] if len(algo_order_ids) > 3 else None
+        # Извлекаем TP order IDs
+        tp1_order_id = algo_order_ids[0] if len(algo_order_ids) > 0 else None
+        tp2_order_id = algo_order_ids[1] if len(algo_order_ids) > 1 else None
+        tp3_order_id = algo_order_ids[2] if len(algo_order_ids) > 2 else None
 
+        # Вставляем в базу данных
         cursor = get_cursor()
         cursor.execute(
             """
@@ -706,8 +715,12 @@ async def process_bybit_signal(user: Dict, signal: Dict) -> Optional[Dict]:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING trade_id
             """,
-            (user_id, 'bybit', order_id, symbol, action, position_side, quantity, price, stop_loss,
-             take_profits[0], take_profits[1], take_profits[2], sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id,
+            (user_id, 'bybit', str(order_id), symbol, action, position_side, quantity, price, stop_loss,
+             take_profits[0], take_profits[1], take_profits[2],
+             str(sl_order_id) if sl_order_id else None,
+             str(tp1_order_id) if tp1_order_id else None,
+             str(tp2_order_id) if tp2_order_id else None,
+             str(tp3_order_id) if tp3_order_id else None,
              'open')
         )
         trade_id = cursor.fetchone()['trade_id']
